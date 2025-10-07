@@ -4,6 +4,7 @@ import numpy as np
 from io import BytesIO
 import math
 import random
+import re
 
 st.set_page_config(page_title="Team Reshuffler", layout="wide")
 
@@ -13,17 +14,29 @@ st.markdown("Upload an Excel file with personnel data to create new teams or res
 # File uploader
 uploaded_file = st.file_uploader("Choose an Excel file", type="xlsx")
 
-def is_officer(comp):
-    return comp.endswith('O')
+def is_officer(value, comp_col):
+    """Check if a value indicates an officer based on ending with 'O'"""
+    if isinstance(value, str):
+        return value.endswith('O')
+    return False
 
-def is_enlisted(comp):
-    return comp.endswith('E')
+def is_enlisted(value, comp_col):
+    """Check if a value indicates enlisted based on ending with 'E'"""
+    if isinstance(value, str):
+        return value.endswith('E')
+    return False
 
-def is_recruit(comp):
-    return comp.endswith('X')
+def is_recruit(value, comp_col):
+    """Check if a value indicates a recruit based on ending with 'X'"""
+    if isinstance(value, str):
+        return value.endswith('X')
+    return False
 
-def calculate_metrics(original_df, new_teams_df, is_reshuffle=True):
+def calculate_metrics(original_df, new_teams_df, column_config, is_reshuffle=True):
     metrics = {}
+    
+    id_col = column_config["id_column"]
+    comp_col = column_config.get("comp_column")
     
     # Team size statistics
     team_sizes = new_teams_df.groupby('New Team').size()
@@ -32,124 +45,132 @@ def calculate_metrics(original_df, new_teams_df, is_reshuffle=True):
     metrics['team_size_avg'] = team_sizes.mean()
     
     # If reshuffling, calculate percentage of people who changed teams
-    if is_reshuffle and 'Original Team' in original_df.columns:
+    if is_reshuffle and column_config.get("original_team_column") and column_config["original_team_column"] in original_df.columns:
+        original_team_col = column_config["original_team_column"]
         total_people = len(original_df)
-        changed_teams = sum(original_df['Original Team'] != new_teams_df['New Team'])
+        changed_teams = sum(original_df[original_team_col] != new_teams_df['New Team'])
         metrics['changed_team_percentage'] = (changed_teams / total_people) * 100
     
-    # Officer/Enlisted/Recruit ratio per team
-    officer_ratio = []
-    enlisted_ratio = []
-    recruit_ratio = []
-    ranger_ratio = []
+    # Calculate ratio statistics for each selected column
+    ratio_stats = {}
     
-    for team in new_teams_df['New Team'].unique():
-        team_data = new_teams_df[new_teams_df['New Team'] == team]
-        officers = sum(team_data['COMP'].apply(is_officer))
-        enlisted = sum(team_data['COMP'].apply(is_enlisted))
-        recruits = sum(team_data['COMP'].apply(is_recruit))
-        rangers = sum(team_data['RGR'] == 'Y')
+    # If we have a composition column, calculate officer/enlisted/recruit ratios
+    if comp_col:
+        for team in new_teams_df['New Team'].unique():
+            team_data = new_teams_df[new_teams_df['New Team'] == team]
+            
+            if team not in ratio_stats:
+                ratio_stats[team] = {}
+            
+            # Officer/Enlisted/Recruit ratio
+            officers = sum(team_data[comp_col].apply(lambda x: is_officer(x, comp_col)))
+            enlisted = sum(team_data[comp_col].apply(lambda x: is_enlisted(x, comp_col)))
+            recruits = sum(team_data[comp_col].apply(lambda x: is_recruit(x, comp_col)))
+            
+            team_size = len(team_data)
+            ratio_stats[team]["Officer %"] = officers / team_size * 100
+            ratio_stats[team]["Enlisted %"] = enlisted / team_size * 100
+            ratio_stats[team]["Recruit %"] = recruits / team_size * 100
+    
+    # Calculate ratios for columns with filled/empty values
+    for column in column_config["priority_columns"]:
+        if column in new_teams_df.columns and new_teams_df[column].notna().any() and new_teams_df[column].isna().any():
+            column_name = f"{column} Filled %"
+            
+            for team in new_teams_df['New Team'].unique():
+                team_data = new_teams_df[new_teams_df['New Team'] == team]
+                
+                if team not in ratio_stats:
+                    ratio_stats[team] = {}
+                
+                # Calculate percentage of filled values
+                filled_count = team_data[column].notna().sum()
+                team_size = len(team_data)
+                ratio_stats[team][column_name] = filled_count / team_size * 100
+    
+    # Convert ratio_stats to lists for the metrics dict
+    for stat_name in set().union(*[stats.keys() for stats in ratio_stats.values()]):
+        stat_values = [stats.get(stat_name, 0) for _, stats in ratio_stats.items()]
+        metrics[f"{stat_name}_values"] = stat_values
+        metrics[f"{stat_name}_std"] = np.std(stat_values)
+    
+    # Calculate standard deviations for numeric columns
+    for column in column_config["priority_columns"]:
+        if column in new_teams_df.columns and pd.api.types.is_numeric_dtype(new_teams_df[column]):
+            std_by_team = new_teams_df.groupby('New Team')[column].std().mean()
+            metrics[f"{column}_std"] = std_by_team if not pd.isna(std_by_team) else 0
+    
+    return metrics, ratio_stats
+
+def create_or_reshuffle_teams(df, column_config, is_reshuffle=True):
+    """
+    Create new teams or reshuffle existing teams based on provided configuration
+    """
+    # Copy the original dataframe
+    original_df = df.copy()
+    
+    id_col = column_config["id_column"]
+    comp_col = column_config.get("comp_column")
+    original_team_col = column_config.get("original_team_column") if is_reshuffle else None
+    priority_columns = column_config["priority_columns"]
+    
+    # Handle missing values in numeric columns
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]) and df[col].isna().any():
+            df[col] = df[col].fillna(df[col].mean())
+    
+    # Determine the number of teams needed
+    total_people = len(df)
+    ideal_team_size = 18
+    min_team_size = 13
+    
+    num_teams = max(math.ceil(total_people / ideal_team_size), math.ceil(total_people / min_team_size))
+    target_team_size = total_people // num_teams
+    
+    # If we have a composition column, ensure at least one officer per team
+    if comp_col:
+        officers = df[df[comp_col].apply(lambda x: is_officer(x, comp_col))].copy() if comp_col else pd.DataFrame()
         
-        officer_ratio.append(officers / len(team_data) * 100)
-        enlisted_ratio.append(enlisted / len(team_data) * 100)
-        recruit_ratio.append(recruits / len(team_data) * 100)
-        ranger_ratio.append(rangers / len(team_data) * 100)
-    
-    metrics['officer_ratio'] = officer_ratio
-    metrics['enlisted_ratio'] = enlisted_ratio
-    metrics['recruit_ratio'] = recruit_ratio
-    metrics['ranger_ratio'] = ranger_ratio
-    metrics['officer_ratio_std'] = np.std(officer_ratio)
-    metrics['enlisted_ratio_std'] = np.std(enlisted_ratio)
-    metrics['recruit_ratio_std'] = np.std(recruit_ratio)
-    metrics['ranger_ratio_std'] = np.std(ranger_ratio)
-    
-    # TIS distribution
-    tis_std_by_team = new_teams_df.groupby('New Team')['TIS'].std().mean()
-    metrics['tis_std'] = tis_std_by_team
-    
-    # Grade distribution
-    # Convert grades to numeric for calculation purposes
-    # E grades
-    e_grades = [grade for grade in original_df['GRADE'].unique() if grade.startswith('E')]
-    o_grades = [grade for grade in original_df['GRADE'].unique() if grade.startswith('O')]
-    
-    # Sort by numeric part
-    e_grades.sort(key=lambda x: int(x[1:]))
-    o_grades.sort(key=lambda x: int(x[1:]))
-    
-    # Combine in order
-    all_grades = e_grades + o_grades
-    
-    rank_mapping = {rank: i for i, rank in enumerate(all_grades)}
-    new_teams_df['Grade_Numeric'] = new_teams_df['GRADE'].map(rank_mapping)
-    rank_std_by_team = new_teams_df.groupby('New Team')['Grade_Numeric'].std().mean()
-    metrics['rank_std'] = rank_std_by_team
-    
-    # Total Points balance
-    # Check if officers have inverse correlation with enlisted/recruits in terms of points
-    correlation_metrics = []
-    for team in new_teams_df['New Team'].unique():
-        team_data = new_teams_df[new_teams_df['New Team'] == team]
-        if sum(team_data['COMP'].apply(is_officer)) > 0 and (sum(team_data['COMP'].apply(is_enlisted)) + sum(team_data['COMP'].apply(is_recruit))) > 0:
-            officer_points = team_data[team_data['COMP'].apply(is_officer)]['TOTAL'].mean()
-            other_points = team_data[~team_data['COMP'].apply(is_officer)]['TOTAL'].mean()
-            correlation_metrics.append(officer_points - other_points)
-    
-    if correlation_metrics:
-        metrics['points_balance'] = np.mean(correlation_metrics)
+        if not officers.empty and len(officers) < num_teams:
+            st.warning(f"Not enough officers ({len(officers)}) to have at least one per team ({num_teams} teams). Continuing with available officers.")
+            num_teams = max(1, len(officers))
     else:
-        metrics['points_balance'] = 0
-    
-    return metrics
-
-def create_teams(df):
-    # Copy the original dataframe
-    original_df = df.copy()
-    
-    # Replace missing values in TOTAL with the mean
-    df['TOTAL'] = df['TOTAL'].fillna(df['TOTAL'].mean())
-    
-    # Determine the number of teams needed
-    total_people = len(df)
-    ideal_team_size = 18
-    min_team_size = 13
-    
-    num_teams = max(math.ceil(total_people / ideal_team_size), math.ceil(total_people / min_team_size))
-    target_team_size = total_people // num_teams
-    
-    # Ensure we have at least one officer per team
-    officers = df[df['COMP'].apply(is_officer)].copy()
-    enlisted = df[df['COMP'].apply(is_enlisted)].copy()
-    recruits = df[df['COMP'].apply(is_recruit)].copy()
-    
-    if len(officers) < num_teams:
-        st.warning(f"Not enough officers ({len(officers)}) to have at least one per team ({num_teams} teams). Continuing with available officers.")
-        num_teams = len(officers)
-    
-    # Sort officers, enlisted and recruits by Total Points
-    officers = officers.sort_values('TOTAL', ascending=False)
-    enlisted = enlisted.sort_values('TOTAL', ascending=True)  # Lower performing enlisted with higher performing officers
-    recruits = recruits.sort_values('TOTAL', ascending=True)  # Same for recruits
+        officers = pd.DataFrame()
     
     # Initialize new teams
     new_teams = {i+1: [] for i in range(num_teams)}
     
-    # First, distribute officers to ensure at least one per team
-    # Higher performing officers go to teams 1, 2, etc.
-    for i, officer_idx in enumerate(officers.index):
-        team_idx = i % num_teams + 1
-        new_teams[team_idx].append(officer_idx)
+    # First, distribute officers to ensure at least one per team (if comp_col is provided)
+    if not officers.empty:
+        # Create sorting keys based on priority columns
+        sort_columns = []
+        if is_reshuffle and original_team_col:
+            sort_columns.append(original_team_col)
+        
+        for col in priority_columns:
+            if col in df.columns and col != original_team_col:
+                # For numeric columns, sort by value; for others, for now just use the column
+                sort_columns.append(col)
+        
+        # Sort officers by priority columns
+        if sort_columns:
+            officers = officers.sort_values(sort_columns)
+        
+        for i, officer_idx in enumerate(officers.index):
+            team_idx = i % num_teams + 1
+            new_teams[team_idx].append(officer_idx)
     
-    # Next, distribute enlisted and recruits
-    # Sort both lists to optimize distribution
-    enlisted = enlisted.sort_values(['GRADE', 'TIS', 'TOTAL'])
-    recruits = recruits.sort_values(['GRADE', 'TIS', 'TOTAL'])
+    # Get the rest of the personnel
+    if not officers.empty:
+        rest = df.loc[~df.index.isin(officers.index)].copy()
+    else:
+        rest = df.copy()
     
-    # Combine and distribute enlisted and recruits
-    others = pd.concat([enlisted, recruits])
+    # Sort rest by priority columns
+    if sort_columns:
+        rest = rest.sort_values(sort_columns)
     
-    # Create a scoring function for creating balanced teams
+    # Create a scoring function for team assignment
     def score_assignment(person_idx, team_idx):
         person = df.loc[person_idx]
         team_members = [df.loc[idx] for idx in new_teams[team_idx]]
@@ -157,55 +178,74 @@ def create_teams(df):
         # Start with a base score
         score = 0
         
-        # Penalize team size imbalance
+        # Penalize team size imbalance (always a high priority)
         target_size = total_people // num_teams
         size_diff = abs(len(team_members) - target_size)
-        score -= size_diff * 50
+        score -= size_diff * 100
         
-        # Consider grade distribution
-        grade_count = {}
-        for member in team_members:
-            grade_count[member['GRADE']] = grade_count.get(member['GRADE'], 0) + 1
-        if person['GRADE'] in grade_count:
-            score -= grade_count[person['GRADE']] * 10
+        # Add penalties based on priority columns
+        penalty_weight = 1000  # Start with high weight and decrease for lower priorities
         
-        # Consider TIS distribution
-        tis_values = [member['TIS'] for member in team_members]
-        if tis_values:
-            avg_tis = sum(tis_values) / len(tis_values)
-            tis_diff = abs(person['TIS'] - avg_tis)
-            score -= tis_diff * 0.5
+        # If reshuffling, heavily penalize same original team
+        if is_reshuffle and original_team_col and original_team_col in df.columns:
+            same_team_count = sum(member[original_team_col] == person[original_team_col] for member in team_members)
+            score -= same_team_count * penalty_weight
+            penalty_weight *= 0.8  # Reduce weight for next priority
         
-        # Encourage balance of Total Points
-        if is_officer(person['COMP']):
-            # For officers, prefer teams with lower average points for non-officers
-            non_officer_points = [member['TOTAL'] for member in team_members 
-                                if not is_officer(member['COMP'])]
-            if non_officer_points:
-                avg_points = sum(non_officer_points) / len(non_officer_points)
-                score += avg_points  # Higher points of non-officers is good for high-point officers
-        else:
-            # For enlisted/recruits, prefer teams with higher average points for officers
-            officer_points = [member['TOTAL'] for member in team_members 
-                             if is_officer(member['COMP'])]
-            if officer_points:
-                avg_points = sum(officer_points) / len(officer_points)
-                score += avg_points  # Higher points of officers is good for low-point enlisted/recruits
+        # Add penalties for each priority column
+        for col in priority_columns:
+            if col in df.columns and col != original_team_col:
+                # Handle different column types differently
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    # For numeric columns, aim for similar averages across teams
+                    col_values = [member[col] for member in team_members]
+                    if col_values:
+                        avg_val = sum(col_values) / len(col_values)
+                        val_diff = abs(person[col] - avg_val)
+                        score -= val_diff * penalty_weight * 0.01  # Scale down for numeric values
+                
+                elif df[col].notna().any() and df[col].isna().any():
+                    # For columns with both filled and empty values, balance them
+                    filled_count = sum(pd.notna(member[col]) for member in team_members)
+                    empty_count = len(team_members) - filled_count
+                    
+                    if pd.notna(person[col]) and filled_count > empty_count:
+                        # Penalty for adding someone with filled value to a team with more filled values
+                        score -= penalty_weight
+                    elif pd.isna(person[col]) and empty_count > filled_count:
+                        # Penalty for adding someone with empty value to a team with more empty values
+                        score -= penalty_weight
+                
+                else:
+                    # For categorical columns, aim for even distribution
+                    if not pd.isna(person[col]):
+                        col_count = sum(member[col] == person[col] for member in team_members if not pd.isna(member[col]))
+                        score -= col_count * penalty_weight * 0.1
+                
+                penalty_weight *= 0.8  # Reduce weight for next priority
         
-        # Consider RGR distribution
-        rgr_values = [member['RGR'] for member in team_members]
-        rgr_count_y = rgr_values.count('Y')
-        rgr_count_n = rgr_values.count('N')
-        
-        if person['RGR'] == 'Y' and rgr_count_y > rgr_count_n:
-            score -= 5  # Small penalty if adding another 'Y' to a team that already has more 'Y' than 'N'
-        elif person['RGR'] == 'N' and rgr_count_n > rgr_count_y:
-            score -= 5  # Small penalty if adding another 'N' to a team that already has more 'N' than 'Y'
+        # If we have a composition column, balance officer/enlisted/recruit
+        if comp_col and comp_col in df.columns:
+            comp_types = [member[comp_col] for member in team_members if not pd.isna(member[comp_col])]
+            if comp_types:
+                # Count officers, enlisted, recruits
+                officer_count = sum(is_officer(comp, comp_col) for comp in comp_types)
+                enlisted_count = sum(is_enlisted(comp, comp_col) for comp in comp_types) 
+                recruit_count = sum(is_recruit(comp, comp_col) for comp in comp_types)
+                
+                # Penalize imbalances
+                person_comp = person[comp_col]
+                if is_officer(person_comp, comp_col) and officer_count > (len(team_members) / 5):  # Roughly 20% officers
+                    score -= penalty_weight * 0.5
+                elif is_enlisted(person_comp, comp_col) and enlisted_count > (len(team_members) * 0.6):  # Roughly 60% enlisted
+                    score -= penalty_weight * 0.5
+                elif is_recruit(person_comp, comp_col) and recruit_count > (len(team_members) * 0.3):  # Roughly 30% recruits
+                    score -= penalty_weight * 0.5
         
         return score
     
     # Distribute the rest based on the scoring function
-    for person_idx in others.index:
+    for person_idx in rest.index:
         # Calculate scores for each team
         scores = {team_idx: score_assignment(person_idx, team_idx) for team_idx in new_teams.keys()}
         
@@ -223,131 +263,7 @@ def create_teams(df):
     
     return new_df
 
-def reshuffle_teams(df):
-    # Copy the original dataframe
-    original_df = df.copy()
-    
-    # Replace missing values in TOTAL with the mean
-    df['TOTAL'] = df['TOTAL'].fillna(df['TOTAL'].mean())
-    
-    # Determine the number of teams needed
-    total_people = len(df)
-    ideal_team_size = 18
-    min_team_size = 13
-    
-    num_teams = max(math.ceil(total_people / ideal_team_size), math.ceil(total_people / min_team_size))
-    target_team_size = total_people // num_teams
-    
-    # Ensure we have at least one officer per team
-    officers = df[df['COMP'].apply(is_officer)].copy()
-    enlisted = df[df['COMP'].apply(is_enlisted)].copy()
-    recruits = df[df['COMP'].apply(is_recruit)].copy()
-    
-    if len(officers) < num_teams:
-        st.warning(f"Not enough officers ({len(officers)}) to have at least one per team ({num_teams} teams). Continuing with available officers.")
-        num_teams = len(officers)
-    
-    # Sort officers, enlisted and recruits by Total Points
-    officers = officers.sort_values('TOTAL', ascending=False)
-    enlisted = enlisted.sort_values('TOTAL', ascending=True)  # Lower performing enlisted with higher performing officers
-    recruits = recruits.sort_values('TOTAL', ascending=True)  # Same for recruits
-    
-    # Initialize new teams
-    new_teams = {i+1: [] for i in range(num_teams)}
-    
-    # First, distribute officers to ensure at least one per team
-    # Higher performing officers go to teams 1, 2, etc.
-    for i, officer_idx in enumerate(officers.index):
-        team_idx = i % num_teams + 1
-        new_teams[team_idx].append(officer_idx)
-    
-    # Next, distribute enlisted and recruits
-    # Sort both lists by original team to maximize team changes
-    enlisted = enlisted.sort_values(['Original Team', 'TIS', 'GRADE', 'TOTAL'])
-    recruits = recruits.sort_values(['Original Team', 'TIS', 'GRADE', 'TOTAL'])
-    
-    # Combine and distribute enlisted and recruits
-    others = pd.concat([enlisted, recruits])
-    
-    # Create a scoring function that encourages different teams
-    def score_assignment(person_idx, team_idx):
-        person = df.loc[person_idx]
-        team_members = [df.loc[idx] for idx in new_teams[team_idx]]
-        
-        # Start with a base score
-        score = 0
-        
-        # Heavily penalize same original team
-        same_team_count = sum(member['Original Team'] == person['Original Team'] for member in team_members)
-        score -= same_team_count * 100
-        
-        # Penalize team size imbalance
-        target_size = total_people // num_teams
-        size_diff = abs(len(team_members) - target_size)
-        score -= size_diff * 50
-        
-        # Consider grade distribution
-        grade_count = {}
-        for member in team_members:
-            grade_count[member['GRADE']] = grade_count.get(member['GRADE'], 0) + 1
-        if person['GRADE'] in grade_count:
-            score -= grade_count[person['GRADE']] * 10
-        
-        # Consider TIS distribution
-        tis_values = [member['TIS'] for member in team_members]
-        if tis_values:
-            avg_tis = sum(tis_values) / len(tis_values)
-            tis_diff = abs(person['TIS'] - avg_tis)
-            score -= tis_diff * 0.5
-        
-        # Encourage balance of Total Points
-        if is_officer(person['COMP']):
-            # For officers, prefer teams with lower average points for non-officers
-            non_officer_points = [member['TOTAL'] for member in team_members 
-                                if not is_officer(member['COMP'])]
-            if non_officer_points:
-                avg_points = sum(non_officer_points) / len(non_officer_points)
-                score += avg_points  # Higher points of non-officers is good for high-point officers
-        else:
-            # For enlisted/recruits, prefer teams with higher average points for officers
-            officer_points = [member['TOTAL'] for member in team_members 
-                             if is_officer(member['COMP'])]
-            if officer_points:
-                avg_points = sum(officer_points) / len(officer_points)
-                score += avg_points  # Higher points of officers is good for low-point enlisted/recruits
-        
-        # Consider RGR distribution (lowest priority)
-        rgr_values = [member['RGR'] for member in team_members]
-        rgr_count_y = rgr_values.count('Y')
-        rgr_count_n = rgr_values.count('N')
-        
-        if person['RGR'] == 'Y' and rgr_count_y > rgr_count_n:
-            score -= 5  # Small penalty if adding another 'Y' to a team that already has more 'Y' than 'N'
-        elif person['RGR'] == 'N' and rgr_count_n > rgr_count_y:
-            score -= 5  # Small penalty if adding another 'N' to a team that already has more 'N' than 'Y'
-        
-        return score
-    
-    # Distribute the rest based on the scoring function
-    for person_idx in others.index:
-        # Calculate scores for each team
-        scores = {team_idx: score_assignment(person_idx, team_idx) for team_idx in new_teams.keys()}
-        
-        # Assign to the team with the highest score
-        best_team = max(scores.items(), key=lambda x: x[1])[0]
-        new_teams[best_team].append(person_idx)
-    
-    # Create a new dataframe with the new team assignments
-    new_df = df.copy()
-    new_df['New Team'] = 0
-    
-    for team_idx, members in new_teams.items():
-        for member_idx in members:
-            new_df.loc[member_idx, 'New Team'] = team_idx
-    
-    return new_df
-
-def display_metrics(metrics, is_reshuffle=True):
+def display_metrics(metrics, ratio_stats, column_config, is_reshuffle=True):
     st.subheader("Team Formation Metrics")
     
     col1, col2, col3 = st.columns(3)
@@ -360,23 +276,34 @@ def display_metrics(metrics, is_reshuffle=True):
         st.metric("Avg Team Size", f"{metrics['team_size_avg']:.1f}")
     
     with col2:
-        st.metric("Officer Ratio Std Dev", f"{metrics['officer_ratio_std']:.2f}%")
-        st.metric("Enlisted Ratio Std Dev", f"{metrics['enlisted_ratio_std']:.2f}%")
-        st.metric("Recruit Ratio Std Dev", f"{metrics['recruit_ratio_std']:.2f}%")
+        # Display standard deviations for key ratios
+        for key, value in metrics.items():
+            if key.endswith("_std") and "values" not in key:
+                nice_name = key.replace("_std", "").replace("_", " ").title()
+                if "%" in nice_name:
+                    st.metric(f"{nice_name} Std Dev", f"{value:.2f}%")
+                else:
+                    st.metric(f"{nice_name} Std Dev", f"{value:.2f}")
     
-    with col3:
-        st.metric("Ranger Ratio Std Dev", f"{metrics['ranger_ratio_std']:.2f}%")
-        st.metric("TIS Distribution Std Dev", f"{metrics['tis_std']:.2f}")
-        st.metric("Grade Distribution Std Dev", f"{metrics['rank_std']:.2f}")
-    
+    # Team composition table
     st.subheader("Team Composition")
-    composition_data = pd.DataFrame({
-        'Team': [f"Team {i+1}" for i in range(len(metrics['officer_ratio']))],
-        'Officer %': [f"{x:.1f}%" for x in metrics['officer_ratio']],
-        'Enlisted %': [f"{x:.1f}%" for x in metrics['enlisted_ratio']],
-        'Recruit %': [f"{x:.1f}%" for x in metrics['recruit_ratio']],
-        'Ranger %': [f"{x:.1f}%" for x in metrics['ranger_ratio']]
-    })
+    
+    # Create a DataFrame from ratio_stats
+    teams = sorted(ratio_stats.keys())
+    stats = {}
+    
+    # Add team numbers
+    stats['Team'] = [f"Team {team}" for team in teams]
+    
+    # Add all available stats
+    all_stat_names = set()
+    for team_stats in ratio_stats.values():
+        all_stat_names.update(team_stats.keys())
+    
+    for stat_name in sorted(all_stat_names):
+        stats[stat_name] = [f"{ratio_stats[team].get(stat_name, 0):.1f}%" for team in teams]
+    
+    composition_data = pd.DataFrame(stats)
     st.dataframe(composition_data)
 
 def to_excel(df_dict):
@@ -390,167 +317,241 @@ def to_excel(df_dict):
     processed_data = output.getvalue()
     return processed_data
 
-def preprocess_data(df):
-    # Handle missing values
-    if 'TOTAL' in df.columns and df['TOTAL'].isna().any():
-        st.warning(f"Missing values found in TOTAL column. {df['TOTAL'].isna().sum()} values will be replaced with the mean.")
-        df['TOTAL'] = df['TOTAL'].fillna(df['TOTAL'].mean())
+def detect_column_types(df):
+    """
+    Detects columns types to suggest configuration
+    """
+    column_types = {}
     
-    if 'TIS' in df.columns and df['TIS'].isna().any():
-        st.warning(f"Missing values found in TIS column. {df['TIS'].isna().sum()} values will be replaced with 0.")
-        df['TIS'] = df['TIS'].fillna(0)
+    # Detect potential ID columns (unique values, often numeric or short strings)
+    potential_id_columns = []
+    for col in df.columns:
+        if df[col].nunique() == len(df):  # Unique values
+            potential_id_columns.append(col)
     
-    return df
+    # Detect potential composition columns (looking for values ending in O, E, X)
+    potential_comp_columns = []
+    for col in df.columns:
+        if df[col].dtype == 'object':  # String columns
+            # Check if any values end with O, E, or X
+            has_o = any(str(val).endswith('O') for val in df[col].dropna())
+            has_e = any(str(val).endswith('E') for val in df[col].dropna())
+            has_x = any(str(val).endswith('X') for val in df[col].dropna())
+            
+            if has_o and (has_e or has_x):
+                potential_comp_columns.append(col)
+    
+    # Detect potential original team columns (few unique values, often numeric)
+    potential_team_columns = []
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]) and 1 < df[col].nunique() < len(df) / 10:
+            potential_team_columns.append(col)
+        elif df[col].dtype == 'object' and 1 < df[col].nunique() < len(df) / 10:
+            # Check if values look like team identifiers
+            if any(str(val).lower().startswith('team') for val in df[col].dropna()):
+                potential_team_columns.append(col)
+    
+    # Detect columns with both filled and empty values
+    partial_filled_columns = []
+    for col in df.columns:
+        if df[col].notna().sum() > 0 and df[col].isna().sum() > 0:
+            partial_filled_columns.append(col)
+    
+    column_types['potential_id_columns'] = potential_id_columns
+    column_types['potential_comp_columns'] = potential_comp_columns
+    column_types['potential_team_columns'] = potential_team_columns
+    column_types['partial_filled_columns'] = partial_filled_columns
+    
+    return column_types
+
+def get_column_config(df):
+    """
+    Let user configure which columns to use for different purposes
+    """
+    column_types = detect_column_types(df)
+    
+    st.subheader("Configure Columns")
+    
+    # Select ID column
+    id_options = column_types['potential_id_columns'] + [col for col in df.columns if col not in column_types['potential_id_columns']]
+    id_col = st.selectbox("Select ID column (unique identifier for each person):", 
+                         id_options, 
+                         index=0 if column_types['potential_id_columns'] else 0)
+    
+    # Select composition column (optional)
+    comp_options = ["None"] + column_types['potential_comp_columns'] + [col for col in df.columns if col not in column_types['potential_comp_columns']]
+    comp_col = st.selectbox("Select composition column (personnel types like ADO, NGO, ADE, etc.):", 
+                           comp_options,
+                           index=1 if column_types['potential_comp_columns'] else 0)
+    comp_col = None if comp_col == "None" else comp_col
+    
+    # For reshuffling, select original team column
+    if 'operation' in st.session_state and st.session_state['operation'] == "Reshuffle existing teams":
+        team_options = ["None"] + column_types['potential_team_columns'] + [col for col in df.columns if col not in column_types['potential_team_columns']]
+        original_team_col = st.selectbox("Select original team column:", 
+                                        team_options,
+                                        index=1 if column_types['potential_team_columns'] else 0)
+        original_team_col = None if original_team_col == "None" else original_team_col
+    else:
+        original_team_col = None
+    
+    # Select priority columns
+    st.write("Select and order columns for team formation priorities:")
+    
+    # Highlight columns with partial filled values
+    if column_types['partial_filled_columns']:
+        st.info(f"Columns with both filled and empty values (good for balancing): {', '.join(column_types['partial_filled_columns'])}")
+    
+    # Multiselect for column priorities
+    available_columns = [col for col in df.columns if col != id_col]
+    default_selections = [col for col in available_columns if col in column_types['partial_filled_columns'] or col in column_types['potential_team_columns']]
+    
+    priority_columns = st.multiselect(
+        "Select columns to use for team formation (in priority order):",
+        available_columns,
+        default=default_selections
+    )
+    
+    column_config = {
+        "id_column": id_col,
+        "comp_column": comp_col,
+        "original_team_column": original_team_col,
+        "priority_columns": priority_columns
+    }
+    
+    return column_config
+
+def display_team_details(new_teams_df, column_config, is_reshuffle=True):
+    """Display detailed information about each team"""
+    id_col = column_config["id_column"]
+    comp_col = column_config.get("comp_column")
+    original_team_col = column_config.get("original_team_column") if is_reshuffle else None
+    priority_columns = column_config["priority_columns"]
+    
+    st.subheader("Team Details")
+    for team in sorted(new_teams_df['New Team'].unique()):
+        with st.expander(f"Team {team}"):
+            team_data = new_teams_df[new_teams_df['New Team'] == team]
+            
+            # Basic team stats
+            st.write(f"Team Size: {len(team_data)}")
+            
+            # If we have a composition column, show officer/enlisted/recruit breakdowns
+            if comp_col:
+                officers = team_data[team_data[comp_col].apply(lambda x: is_officer(x, comp_col))]
+                enlisted = team_data[team_data[comp_col].apply(lambda x: is_enlisted(x, comp_col))]
+                recruits = team_data[team_data[comp_col].apply(lambda x: is_recruit(x, comp_col))]
+                
+                st.write(f"Officers: {len(officers)} ({len(officers)/len(team_data)*100:.1f}%)")
+                st.write(f"Enlisted: {len(enlisted)} ({len(enlisted)/len(team_data)*100:.1f}%)")
+                st.write(f"Recruits: {len(recruits)} ({len(recruits)/len(team_data)*100:.1f}%)")
+            
+            # Show stats for each priority column
+            for col in priority_columns:
+                if col in team_data.columns:
+                    # For columns with both filled and empty values, show the balance
+                    if team_data[col].notna().any() and team_data[col].isna().any():
+                        filled = team_data[col].notna().sum()
+                        st.write(f"{col} - Filled values: {filled} ({filled/len(team_data)*100:.1f}%)")
+                    
+                    # For numeric columns, show average
+                    if pd.api.types.is_numeric_dtype(team_data[col]):
+                        st.write(f"Average {col}: {team_data[col].mean():.2f}")
+            
+            # For reshuffling, show original team breakdown
+            if is_reshuffle and original_team_col and original_team_col in team_data.columns:
+                st.write("Members from original teams:")
+                original_teams = team_data[original_team_col].value_counts()
+                for orig_team, count in original_teams.items():
+                    st.write(f"- Team {orig_team}: {count} members")
+            
+            # Show the team data
+            st.dataframe(team_data)
 
 if uploaded_file is not None:
     try:
         df = pd.read_excel(uploaded_file)
         
-        # Check if the dataframe has the required columns
-        required_columns = ['ROSTER', 'COMP', 'GRADE', 'RGR', 'TIS', 'TOTAL']
-        missing_columns = [col for col in required_columns if col not in df.columns]
+        st.write("Data preview:")
+        st.dataframe(df.head())
         
-        if missing_columns:
-            st.error(f"Missing required columns: {', '.join(missing_columns)}")
-        else:
-            # Preprocess data
-            df = preprocess_data(df)
-            
-            st.write("Data preview:")
-            st.dataframe(df.head())
-            
-            # Choose operation - create new teams or reshuffle
-            operation = st.radio("Choose operation:", 
-                             ["Create new teams from scratch", "Reshuffle existing teams"])
-            
-            if operation == "Reshuffle existing teams":
-                # Check if Original Team column exists
-                if 'Original Team' not in df.columns:
-                    st.warning("Original Team column not found. Please select a column to use for original team assignment:")
-                    
-                    method = st.radio("Choose how to assign Original Teams:", 
-                                     ["Use existing column", "Randomly assign teams"])
-                    
-                    if method == "Use existing column":
-                        team_col = st.selectbox("Select column to use as Original Team:", df.columns)
-                        df['Original Team'] = df[team_col]
-                    else:
-                        num_teams = st.number_input("Number of original teams:", min_value=1, value=max(1, len(df) // 18))
-                        df['Original Team'] = [random.randint(1, int(num_teams)) for _ in range(len(df))]
-            
-            if st.button("Process Teams"):
+        # Choose operation - create new teams or reshuffle
+        operation = st.radio("Choose operation:", 
+                         ["Create new teams from scratch", "Reshuffle existing teams"])
+        st.session_state['operation'] = operation
+        
+        # Let user configure columns
+        column_config = get_column_config(df)
+        
+        # For reshuffling, ensure we have an original team column
+        if operation == "Reshuffle existing teams":
+            if not column_config["original_team_column"]:
+                st.warning("No original team column selected. Please either select a column or create random teams:")
+                
+                create_random = st.checkbox("Create random original teams")
+                if create_random:
+                    num_teams = st.number_input("Number of original teams:", min_value=1, value=max(1, len(df) // 18))
+                    df['Random Original Team'] = [random.randint(1, int(num_teams)) for _ in range(len(df))]
+                    column_config["original_team_column"] = 'Random Original Team'
+                    st.success("Random original teams created!")
+        
+        # Proceed with team formation
+        if st.button("Process Teams"):
+            # Ensure we have required configurations
+            if operation == "Reshuffle existing teams" and not column_config["original_team_column"]:
+                st.error("Please select an original team column or create random teams to proceed with reshuffling.")
+            else:
                 with st.spinner("Processing teams..."):
-                    if operation == "Create new teams from scratch":
-                        new_teams_df = create_teams(df)
-                        metrics = calculate_metrics(df, new_teams_df, is_reshuffle=False)
-                        
-                        st.success("Teams created successfully!")
-                        
-                        display_metrics(metrics, is_reshuffle=False)
-                        
-                        st.subheader("Team Assignments")
-                        st.dataframe(new_teams_df.sort_values(['New Team', 'COMP']))
-                        
-                        # Prepare Excel download
-                        excel_data = to_excel({
-                            'Original Data': df,
-                            'New Teams': new_teams_df
-                        })
-                        
-                        st.download_button(
-                            label="Download Excel with team assignments",
-                            data=excel_data,
-                            file_name="team_assignments.xlsx",
-                            mime="application/vnd.ms-excel"
-                        )
-                    else:  # Reshuffle existing teams
-                        new_teams_df = reshuffle_teams(df)
-                        metrics = calculate_metrics(df, new_teams_df, is_reshuffle=True)
-                        
-                        st.success("Teams reshuffled successfully!")
-                        
-                        display_metrics(metrics, is_reshuffle=True)
-                        
-                        st.subheader("New Team Assignments")
-                        st.dataframe(new_teams_df.sort_values(['New Team', 'COMP']))
-                        
-                        # Prepare Excel download
-                        excel_data = to_excel({
-                            'Original Data': df,
-                            'New Teams': new_teams_df
-                        })
-                        
-                        st.download_button(
-                            label="Download Excel with new teams",
-                            data=excel_data,
-                            file_name="reshuffled_teams.xlsx",
-                            mime="application/vnd.ms-excel"
-                        )
+                    is_reshuffle = operation == "Reshuffle existing teams"
+                    new_teams_df = create_or_reshuffle_teams(df, column_config, is_reshuffle=is_reshuffle)
+                    metrics, ratio_stats = calculate_metrics(df, new_teams_df, column_config, is_reshuffle=is_reshuffle)
+                    
+                    st.success(f"Teams {'reshuffled' if is_reshuffle else 'created'} successfully!")
+                    
+                    display_metrics(metrics, ratio_stats, column_config, is_reshuffle=is_reshuffle)
+                    
+                    st.subheader(f"{'New' if is_reshuffle else ''} Team Assignments")
+                    st.dataframe(new_teams_df.sort_values(['New Team']))
+                    
+                    # Prepare Excel download
+                    excel_data = to_excel({
+                        'Original Data': df,
+                        'New Teams': new_teams_df
+                    })
+                    
+                    st.download_button(
+                        label=f"Download Excel with {'new' if is_reshuffle else ''} teams",
+                        data=excel_data,
+                        file_name=f"{'reshuffled' if is_reshuffle else 'new'}_teams.xlsx",
+                        mime="application/vnd.ms-excel"
+                    )
                     
                     # Show detailed team view
-                    st.subheader("Team Details")
-                    for team in sorted(new_teams_df['New Team'].unique()):
-                        with st.expander(f"Team {team}"):
-                            team_data = new_teams_df[new_teams_df['New Team'] == team]
-                            officers = team_data[team_data['COMP'].apply(is_officer)]
-                            enlisted = team_data[team_data['COMP'].apply(is_enlisted)]
-                            recruits = team_data[team_data['COMP'].apply(is_recruit)]
-                            rangers = team_data[team_data['RGR'] == 'Y']
-                            
-                            st.write(f"Team Size: {len(team_data)}")
-                            st.write(f"Officers: {len(officers)} ({len(officers)/len(team_data)*100:.1f}%)")
-                            st.write(f"Enlisted: {len(enlisted)} ({len(enlisted)/len(team_data)*100:.1f}%)")
-                            st.write(f"Recruits: {len(recruits)} ({len(recruits)/len(team_data)*100:.1f}%)")
-                            st.write(f"Rangers: {len(rangers)} ({len(rangers)/len(team_data)*100:.1f}%)")
-                            
-                            st.write(f"Average TIS: {team_data['TIS'].mean():.1f}")
-                            st.write(f"Average Points: {team_data['TOTAL'].mean():.1f}")
-                            
-                            # Show how many members are from the same original team (for reshuffling only)
-                            if operation == "Reshuffle existing teams" and 'Original Team' in team_data.columns:
-                                original_teams = team_data['Original Team'].value_counts()
-                                st.write("Members from original teams:")
-                                for orig_team, count in original_teams.items():
-                                    st.write(f"- Team {orig_team}: {count} members")
-                            
-                            st.dataframe(team_data)
+                    display_team_details(new_teams_df, column_config, is_reshuffle=is_reshuffle)
     
     except Exception as e:
         st.error(f"Error processing file: {e}")
+        st.exception(e)
 else:
     st.info("Please upload an Excel file with personnel data.")
     
     # Show example format
-    st.subheader("Expected Excel Format:")
-    example_data = {
-        'ROSTER': [1, 2, 3, 4, 5],
-        'COMP': ['ADO', 'NGO', 'ADE', 'NGE', 'AD18X'],
-        'GRADE': ['O3', 'O2', 'E6', 'E4', 'E3'],
-        'RGR': ['Y', 'N', 'Y', 'N', 'N'],
-        'TIS': [10, 8, 6, 4, 0],
-        'TOTAL': [95, 85, 75, 60, 50],
-    }
-    example_df = pd.DataFrame(example_data)
-    st.dataframe(example_df)
-    
+    st.subheader("Example Data Format:")
     st.markdown("""
-    ### Operations:
-    1. **Create new teams from scratch**: 
-       - Forms teams based on balanced distribution of grades, points, TIS, and ranger status
-       - Ensures each team has at least one officer
-       
-    2. **Reshuffle existing teams**:
-       - Requires 'Original Team' column (or will ask to select/generate one)
-       - Prioritizes moving people to different teams than their original
-       - Maintains balance across teams for all attributes
-       - Minimizes number of people remaining on the same team
+    Upload an Excel file with your team data. The app will help you configure:
     
-    ### Team Formation Logic:
-    Teams are balanced to ensure:
-    - Size between 13-18 members (ideally 18)
-    - At least one officer per team
-    - Even distribution of ranks, TIS, and ranger qualification
-    - Performance balance between officers and enlisted/recruits
+    1. Which column contains unique identifiers
+    2. Which column (if any) indicates personnel types (officers/enlisted/recruits)
+    3. Which columns to use for team formation priorities
+    4. For reshuffling, which column indicates original teams
+    
+    The app will automatically detect:
+    - Potential ID columns
+    - Columns that might indicate personnel types
+    - Columns that could represent teams
+    - Columns with both filled and empty values (useful for balancing experienced/inexperienced personnel)
+    
+    You can then customize the column selection and priorities to match your specific needs.
     """)
 
 # Add footer with instructions for GitHub deployment

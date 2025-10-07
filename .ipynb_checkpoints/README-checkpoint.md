@@ -1,49 +1,55 @@
 # Team Reshuffler
 
-This Streamlit application reshuffles military teams based on various criteria to ensure optimal team composition and personnel distribution.
+A flexible Streamlit application for creating and reshuffling teams based on configurable criteria and priorities.
 
 ## Overview
 
-The Team Reshuffler is designed to take an existing team structure and create new, balanced teams while ensuring:
+This Team Reshuffler application is designed to help organize personnel into balanced teams. It offers two main functionalities:
 
-- Teams have 13-18 members (ideally 18)
-- Each team has at least one officer
-- Team members are distributed to minimize people remaining on the same team as before
-- Even distribution of ranks, time in service, and performance points
-- Balance of officers and enlisted/recruits based on performance
-- Proportional distribution of rangers across teams
+1. **Create new teams from scratch**: Form teams based on balanced distribution of attributes
+2. **Reshuffle existing teams**: Reorganize teams while minimizing people remaining on the same team
+
+The application is highly configurable, allowing users to select which data columns to use and their priority order in team formation.
 
 ## Features
 
-- **Data Import**: Upload your team data as an Excel file
-- **Intelligent Reshuffling**: Algorithm prioritizes different team members first, followed by rank distribution, total points, TIS, and ranger status
-- **Comprehensive Metrics**: View statistics on team composition and how well the reshuffling meets criteria
-- **Team Details**: Explore detailed breakdowns of each new team
-- **Export Results**: Download the new team assignments as an Excel file
+- **Flexible Data Input**: Works with any Excel file format - column names don't matter
+- **Dynamic Configuration**: Select which columns to use for different purposes (ID, team assignment, priorities)
+- **Intelligent Column Detection**: Automatically identifies potential ID columns, team columns, and columns with filled/empty values
+- **Customizable Priorities**: Set the order of importance for different attributes when forming teams
+- **Comprehensive Metrics**: View detailed statistics on team balance across all selected attributes
+- **Team Details**: Explore the composition and statistics for each team
+- **Export Results**: Download the team assignments as an Excel file
 
-## Required Data Format
+## How It Works
 
-The application expects an Excel file with the following columns:
+1. **Upload Data**: Start by uploading an Excel file with your personnel data
+2. **Select Operation**: Choose whether to create new teams or reshuffle existing ones
+3. **Configure Columns**:
+   - Select which column contains unique identifiers
+   - Choose which column (if any) represents personnel types
+   - For reshuffling, select which column contains original team assignments
+   - Choose and prioritize columns to use for team formation
+4. **Process Teams**: The algorithm creates balanced teams based on your configuration
+5. **View Results**: Examine team metrics and detailed breakdowns
+6. **Download**: Export the new team assignments to Excel
 
-| Column | Description |
-|--------|-------------|
-| ROSTER | Unique identifier for each person |
-| COMP | Type of person (ADO, NGO, ADE, NGE, AD18X, NG18X) - Officers end in O, enlisted end in E, recruits end in X |
-| GRADE | Military grade (e.g., O3, O2, E6, E5) |
-| RGR | Ranger status (Y/N) |
-| TIS | Time in service (years) |
-| TOTAL | Performance points earned |
-| Original Team | Current team assignment |
+## Special Features
 
-## Reshuffling Logic
+- **Personnel Type Detection**: Automatically identifies columns that might represent personnel types (e.g., officers, enlisted, recruits)
+- **Filled/Empty Value Balancing**: Automatically detects and balances columns with both filled and empty values (useful for experienced/inexperienced members)
+- **Team Size Optimization**: Creates teams of 13-18 members with ideal size being 18
+- **Officer Distribution**: Ensures at least one officer per team (if personnel type column is provided)
+- **Priority-Based Scoring**: Assigns people to teams using a sophisticated scoring system based on your priority order
 
-The application uses a scoring algorithm with the following priorities (from highest to lowest):
+## Team Formation Logic
 
-1. Minimize personnel remaining on the same team
-2. Ensure even distribution of ranks
-3. Balance total points (high-performing officers with low-performing enlisted and vice versa)
-4. Even distribution of time in service
-5. Balanced distribution of ranger-qualified personnel
+The application uses a scoring algorithm that:
+1. Assigns greater weight to higher-priority columns
+2. Ensures even distribution of categorical values (like ranks, types, etc.)
+3. Balances numeric values (like time in service, performance points)
+4. Evenly distributes personnel with filled vs. empty values for relevant columns
+5. When reshuffling, minimizes the number of people who remain on their original team
 
 ## Local Development
 
@@ -87,4 +93,4 @@ For questions or support, please open an issue on this repository.
 
 ---
 
-*Note: This application is designed for military team management but can be adapted for other team reshuffling needs with appropriate data modifications.*
+*Originally developed for military team management but adaptable for any team organization needs.*
