@@ -70,7 +70,7 @@ def calculate_metrics(original_df, new_teams_df, column_config, is_reshuffle=Tru
             team_size = len(team_data)
             ratio_stats[team]["Officer %"] = officers / team_size * 100
             ratio_stats[team]["Enlisted %"] = enlisted / team_size * 100
-            ratio_stats[team]["Recruit %"] = recruits / team_size * 100
+            ratio_stats[team]["18X %"] = recruits / team_size * 100
     
     # Calculate ratios for columns with filled/empty values
     for column in column_config["priority_columns"]:
@@ -472,7 +472,7 @@ def display_team_details(new_teams_df, column_config, is_reshuffle=True):
                 
                 st.write(f"Officers: {len(officers)} ({len(officers)/len(team_data)*100:.1f}%)")
                 st.write(f"Enlisted: {len(enlisted)} ({len(enlisted)/len(team_data)*100:.1f}%)")
-                st.write(f"Recruits: {len(recruits)} ({len(recruits)/len(team_data)*100:.1f}%)")
+                st.write(f"18Xs: {len(recruits)} ({len(recruits)/len(team_data)*100:.1f}%)")
             
             # Show stats for each priority column
             for col in priority_columns:
@@ -813,7 +813,7 @@ else:
     Upload an Excel file with your team data. The app will help you configure:
     
     1. Which column contains unique identifiers
-    2. Which column (if any) indicates personnel types (officers/enlisted/recruits)
+    2. Which column (if any) indicates personnel types (officers/enlisted/18Xs)
     3. Which columns to use for team formation priorities
     4. For reshuffling, which column indicates original teams
     5. Minimum and maximum team sizes
