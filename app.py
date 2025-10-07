@@ -89,7 +89,7 @@ def calculate_metrics(original_df, new_teams_df, column_config, is_reshuffle=Tru
                 ratio_stats[team][column_name] = filled_count / team_size * 100
     
     # Convert ratio_stats to lists for the metrics dict
-    for stat_name in set().union(*[stats.keys() for stats in ratio_stats.values()]):
+    for stat_name in set().union(*[stats.keys() for stats in ratio_stats.values()]) if ratio_stats else []:
         stat_values = [stats.get(stat_name, 0) for _, stats in ratio_stats.items()]
         metrics[f"{stat_name}_values"] = stat_values
         metrics[f"{stat_name}_std"] = np.std(stat_values)
@@ -102,7 +102,7 @@ def calculate_metrics(original_df, new_teams_df, column_config, is_reshuffle=Tru
     
     return metrics, ratio_stats
 
-def create_or_reshuffle_teams(df, column_config, is_reshuffle=True):
+def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_size=13, max_team_size=18):
     """
     Create new teams or reshuffle existing teams based on provided configuration
     """
@@ -121,11 +121,21 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True):
     
     # Determine the number of teams needed
     total_people = len(df)
-    ideal_team_size = 18
-    min_team_size = 13
     
-    num_teams = max(math.ceil(total_people / ideal_team_size), math.ceil(total_people / min_team_size))
-    target_team_size = total_people // num_teams
+    # Calculate minimum number of teams needed to not exceed max_team_size
+    min_num_teams = math.ceil(total_people / max_team_size)
+    
+    # Calculate maximum number of teams that would still maintain min_team_size
+    max_num_teams = math.floor(total_people / min_team_size)
+    
+    # If min > max, we need to prioritize min_team_size
+    if min_num_teams > max_num_teams:
+        num_teams = min_num_teams
+    else:
+        # Otherwise use min_num_teams to maximize team sizes
+        num_teams = min_num_teams
+    
+    st.write(f"Creating {num_teams} teams for {total_people} people.")
     
     # If we have a composition column, ensure at least one officer per team
     if comp_col:
@@ -178,10 +188,18 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True):
         # Start with a base score
         score = 0
         
-        # Penalize team size imbalance (always a high priority)
-        target_size = total_people // num_teams
-        size_diff = abs(len(team_members) - target_size)
-        score -= size_diff * 100
+        # Penalize team size imbalance with higher penalty for exceeding max
+        team_size = len(team_members) + 1  # +1 to include the person being added
+        
+        # If the team is below max, encourage adding more
+        if team_size <= max_team_size:
+            # Less penalty for teams closer to max size
+            size_diff = max_team_size - team_size
+            score -= size_diff * 20  # Small penalty - we want to fill teams to max if possible
+        else:
+            # Higher penalty for exceeding max
+            size_diff = team_size - max_team_size
+            score -= size_diff * 200  # Stronger penalty for exceeding max
         
         # Add penalties based on priority columns
         penalty_weight = 1000  # Start with high weight and decrease for lower priorities
@@ -289,31 +307,32 @@ def display_metrics(metrics, ratio_stats, column_config, is_reshuffle=True):
     st.subheader("Team Composition")
     
     # Create a DataFrame from ratio_stats
-    teams = sorted(ratio_stats.keys())
-    stats = {}
-    
-    # Add team numbers
-    stats['Team'] = [f"Team {team}" for team in teams]
-    
-    # Add all available stats
-    all_stat_names = set()
-    for team_stats in ratio_stats.values():
-        all_stat_names.update(team_stats.keys())
-    
-    for stat_name in sorted(all_stat_names):
-        stats[stat_name] = [f"{ratio_stats[team].get(stat_name, 0):.1f}%" for team in teams]
-    
-    composition_data = pd.DataFrame(stats)
-    st.dataframe(composition_data)
+    if ratio_stats:
+        teams = sorted(ratio_stats.keys())
+        stats = {}
+        
+        # Add team numbers
+        stats['Team'] = [f"Team {team}" for team in teams]
+        
+        # Add all available stats
+        all_stat_names = set()
+        for team_stats in ratio_stats.values():
+            all_stat_names.update(team_stats.keys())
+        
+        for stat_name in sorted(all_stat_names):
+            stats[stat_name] = [f"{ratio_stats[team].get(stat_name, 0):.1f}%" for team in teams]
+        
+        composition_data = pd.DataFrame(stats)
+        st.dataframe(composition_data)
+    else:
+        st.write("No team composition statistics available.")
 
 def to_excel(df_dict):
     output = BytesIO()
-    writer = pd.ExcelWriter(output, engine='xlsxwriter')
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        for sheet_name, df in df_dict.items():
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
     
-    for sheet_name, df in df_dict.items():
-        df.to_excel(writer, sheet_name=sheet_name, index=False)
-    
-    writer.save()
     processed_data = output.getvalue()
     return processed_data
 
@@ -495,6 +514,14 @@ if uploaded_file is not None:
                     column_config["original_team_column"] = 'Random Original Team'
                     st.success("Random original teams created!")
         
+        # Team size configuration
+        st.subheader("Team Size Settings")
+        col1, col2 = st.columns(2)
+        with col1:
+            min_team_size = st.number_input("Minimum team size:", min_value=1, value=13)
+        with col2:
+            max_team_size = st.number_input("Maximum team size (ideal size):", min_value=min_team_size, value=18)
+        
         # Proceed with team formation
         if st.button("Process Teams"):
             # Ensure we have required configurations
@@ -503,7 +530,8 @@ if uploaded_file is not None:
             else:
                 with st.spinner("Processing teams..."):
                     is_reshuffle = operation == "Reshuffle existing teams"
-                    new_teams_df = create_or_reshuffle_teams(df, column_config, is_reshuffle=is_reshuffle)
+                    new_teams_df = create_or_reshuffle_teams(df, column_config, is_reshuffle=is_reshuffle, 
+                                                            min_team_size=min_team_size, max_team_size=max_team_size)
                     metrics, ratio_stats = calculate_metrics(df, new_teams_df, column_config, is_reshuffle=is_reshuffle)
                     
                     st.success(f"Teams {'reshuffled' if is_reshuffle else 'created'} successfully!")
@@ -544,6 +572,7 @@ else:
     2. Which column (if any) indicates personnel types (officers/enlisted/recruits)
     3. Which columns to use for team formation priorities
     4. For reshuffling, which column indicates original teams
+    5. Minimum and maximum team sizes
     
     The app will automatically detect:
     - Potential ID columns
