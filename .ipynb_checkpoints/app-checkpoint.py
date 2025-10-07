@@ -418,4 +418,11 @@ st.markdown("""
 ### How to deploy this app:
 1. Create a GitHub repository
 2. Add this file as `app.py`
-3. Create a `requirements.txt` 
+3. Create a `requirements.txt` file with:
+streamlit
+pandas
+numpy
+openpyxl
+xlsxwriter
+4. Deploy to Streamlit Cloud by connecting to your GitHub repository
+""")
