@@ -290,6 +290,156 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
     
     return new_df
 
+def edit_teams(new_teams_df, column_config):
+    """
+    Allow users to manually edit team assignments
+    """
+    st.subheader("Manual Team Adjustment")
+    
+    id_col = column_config["id_column"]
+    comp_col = column_config.get("comp_column")
+    
+    # Create a copy to avoid modifying the original
+    edited_df = new_teams_df.copy()
+    
+    # Create two columns for the interface
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Move Member to Different Team")
+        
+        # Select a team to view
+        teams = sorted(edited_df['New Team'].unique())
+        source_team = st.selectbox("Select source team:", teams, key="source_team")
+        
+        # Display team members
+        team_data = edited_df[edited_df['New Team'] == source_team]
+        
+        # Create a nice display name for each member
+        if comp_col:
+            team_data['Display Name'] = team_data.apply(
+                lambda row: f"{row[id_col]} - {row[comp_col]} - {row['GRADE'] if 'GRADE' in row else ''}", 
+                axis=1
+            )
+        else:
+            # Use ID and any other relevant columns
+            additional_cols = ['GRADE', 'RANK', 'Name'] 
+            display_cols = [col for col in additional_cols if col in team_data.columns]
+            
+            if display_cols:
+                team_data['Display Name'] = team_data.apply(
+                    lambda row: f"{row[id_col]} - " + " - ".join([str(row[col]) for col in display_cols]), 
+                    axis=1
+                )
+            else:
+                team_data['Display Name'] = team_data[id_col].astype(str)
+        
+        # Select a member to move
+        member_options = team_data['Display Name'].tolist()
+        selected_member = st.selectbox("Select member to move:", member_options, key="member_select")
+        
+        # Find the selected member's ID
+        selected_member_row = team_data[team_data['Display Name'] == selected_member].iloc[0]
+        selected_member_id = selected_member_row[id_col]
+        
+        # Select destination team
+        destination_team = st.selectbox(
+            "Select destination team:", 
+            [team for team in teams if team != source_team],
+            key="destination_team"
+        )
+        
+        if st.button("Move Member"):
+            # Update the team assignment
+            edited_df.loc[edited_df[id_col] == selected_member_id, 'New Team'] = destination_team
+            st.success(f"Moved {selected_member} from Team {source_team} to Team {destination_team}")
+            
+            # Check team sizes
+            source_size = len(edited_df[edited_df['New Team'] == source_team])
+            dest_size = len(edited_df[edited_df['New Team'] == destination_team])
+            
+            if source_size < column_config.get("min_team_size", 13):
+                st.warning(f"Team {source_team} now has {source_size} members (below minimum)")
+            if dest_size > column_config.get("max_team_size", 18):
+                st.warning(f"Team {destination_team} now has {dest_size} members (above maximum)")
+    
+    with col2:
+        st.subheader("Swap Two Members")
+        
+        # Select first team
+        first_team = st.selectbox("Select first team:", teams, key="first_team")
+        
+        # Display first team members
+        first_team_data = edited_df[edited_df['New Team'] == first_team]
+        first_team_data['Display Name'] = first_team_data.apply(
+            lambda row: f"{row[id_col]} - {row[comp_col] if comp_col else ''}", 
+            axis=1
+        )
+        
+        # Select a member from first team
+        first_member = st.selectbox(
+            "Select member from first team:", 
+            first_team_data['Display Name'].tolist(),
+            key="first_member"
+        )
+        
+        # Find the selected member's ID
+        first_member_id = first_team_data[first_team_data['Display Name'] == first_member].iloc[0][id_col]
+        
+        # Select second team
+        second_team = st.selectbox(
+            "Select second team:", 
+            [team for team in teams if team != first_team],
+            key="second_team"
+        )
+        
+        # Display second team members
+        second_team_data = edited_df[edited_df['New Team'] == second_team]
+        second_team_data['Display Name'] = second_team_data.apply(
+            lambda row: f"{row[id_col]} - {row[comp_col] if comp_col else ''}", 
+            axis=1
+        )
+        
+        # Select a member from second team
+        second_member = st.selectbox(
+            "Select member from second team:", 
+            second_team_data['Display Name'].tolist(),
+            key="second_member"
+        )
+        
+        # Find the selected member's ID
+        second_member_id = second_team_data[second_team_data['Display Name'] == second_member].iloc[0][id_col]
+        
+        if st.button("Swap Members"):
+            # Update the team assignments
+            edited_df.loc[edited_df[id_col] == first_member_id, 'New Team'] = second_team
+            edited_df.loc[edited_df[id_col] == second_member_id, 'New Team'] = first_team
+            
+            st.success(f"Swapped {first_member} and {second_member}")
+    
+    # Display the updated team assignments
+    st.subheader("Updated Team Assignments")
+    st.dataframe(edited_df.sort_values(['New Team', id_col]))
+    
+    # Calculate new metrics
+    metrics, ratio_stats = calculate_metrics(edited_df, edited_df, column_config, is_reshuffle=False)
+    display_metrics(metrics, ratio_stats, column_config, is_reshuffle=False)
+    
+    # Prepare Excel download for edited teams
+    excel_data = to_excel({
+        'Original Data': new_teams_df,
+        'Edited Teams': edited_df
+    })
+    
+    st.download_button(
+        label="Download Excel with edited teams",
+        data=excel_data,
+        file_name="edited_teams.xlsx",
+        mime="application/vnd.ms-excel"
+    )
+    
+    return edited_df
+
 def display_metrics(metrics, ratio_stats, column_config, is_reshuffle=True):
     st.subheader("Team Formation Metrics")
     
@@ -565,6 +715,19 @@ if uploaded_file is not None:
                     
                     # Show detailed team view
                     display_team_details(new_teams_df, column_config, is_reshuffle=is_reshuffle)
+
+                    # Add this after displaying the team details, inside the "Process Teams" button block
+                    st.subheader("Edit Team Assignments")
+                    edit_option = st.checkbox("I want to manually adjust teams")
+                    if edit_option:
+                        # Store minimum and maximum team size in column_config for reference
+                        column_config["min_team_size"] = min_team_size
+                        column_config["max_team_size"] = max_team_size
+                        edited_teams_df = edit_teams(new_teams_df, column_config)
+                        
+                        # Show detailed team view for edited teams
+                        st.subheader("Edited Team Details")
+                        display_team_details(edited_teams_df, column_config, is_reshuffle=is_reshuffle)
     
     except Exception as e:
         st.error(f"Error processing file: {e}")
