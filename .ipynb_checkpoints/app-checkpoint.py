@@ -122,20 +122,11 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
     # Determine the number of teams needed
     total_people = len(df)
     
-    # Calculate minimum number of teams needed to not exceed max_team_size
-    min_num_teams = math.ceil(total_people / max_team_size)
-    
-    # Calculate maximum number of teams that would still maintain min_team_size
-    max_num_teams = math.floor(total_people / min_team_size)
-    
-    # If min > max, we need to prioritize min_team_size
-    if min_num_teams > max_num_teams:
-        num_teams = min_num_teams
-    else:
-        # Otherwise use min_num_teams to maximize team sizes
-        num_teams = min_num_teams
+    # Always ensure we have enough teams so that no team exceeds max_team_size
+    num_teams = math.ceil(total_people / max_team_size)
     
     st.write(f"Creating {num_teams} teams for {total_people} people.")
+    st.write(f"Team size range: {min_team_size}-{max_team_size} members (ideal: {max_team_size}).")
     
     # If we have a composition column, ensure at least one officer per team
     if comp_col:
@@ -143,12 +134,18 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
         
         if not officers.empty and len(officers) < num_teams:
             st.warning(f"Not enough officers ({len(officers)}) to have at least one per team ({num_teams} teams). Continuing with available officers.")
-            num_teams = max(1, len(officers))
+            # In this case, adjust the number of teams to match available officers
+            if len(officers) > 0:  # Make sure we have at least one officer
+                num_teams = len(officers)
+                st.write(f"Adjusted to {num_teams} teams due to officer constraint.")
     else:
         officers = pd.DataFrame()
     
     # Initialize new teams
     new_teams = {i+1: [] for i in range(num_teams)}
+    
+    # Create a tracking dictionary to store current team sizes
+    team_sizes = {i+1: 0 for i in range(num_teams)}
     
     # First, distribute officers to ensure at least one per team (if comp_col is provided)
     if not officers.empty:
@@ -169,6 +166,7 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
         for i, officer_idx in enumerate(officers.index):
             team_idx = i % num_teams + 1
             new_teams[team_idx].append(officer_idx)
+            team_sizes[team_idx] += 1
     
     # Get the rest of the personnel
     if not officers.empty:
@@ -177,29 +175,26 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
         rest = df.copy()
     
     # Sort rest by priority columns
-    if sort_columns:
+    if 'sort_columns' in locals() and sort_columns:
         rest = rest.sort_values(sort_columns)
     
-    # Create a scoring function for team assignment
+    # Create a scoring function for team assignment with strict max size enforcement
     def score_assignment(person_idx, team_idx):
         person = df.loc[person_idx]
         team_members = [df.loc[idx] for idx in new_teams[team_idx]]
+        team_size = team_sizes[team_idx]
+        
+        # If team is already at max size, make it ineligible
+        if team_size >= max_team_size:
+            return float('-inf')  # Return negative infinity to ensure this team is not selected
         
         # Start with a base score
         score = 0
         
-        # Penalize team size imbalance with higher penalty for exceeding max
-        team_size = len(team_members) + 1  # +1 to include the person being added
-        
-        # If the team is below max, encourage adding more
-        if team_size <= max_team_size:
-            # Less penalty for teams closer to max size
-            size_diff = max_team_size - team_size
-            score -= size_diff * 20  # Small penalty - we want to fill teams to max if possible
-        else:
-            # Higher penalty for exceeding max
-            size_diff = team_size - max_team_size
-            score -= size_diff * 200  # Stronger penalty for exceeding max
+        # Penalize teams closer to max size less (to fill them up first)
+        # But still maintain a slight penalty to balance other factors
+        size_penalty = (max_team_size - team_size) * 10
+        score -= size_penalty
         
         # Add penalties based on priority columns
         penalty_weight = 1000  # Start with high weight and decrease for lower priorities
@@ -267,9 +262,18 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
         # Calculate scores for each team
         scores = {team_idx: score_assignment(person_idx, team_idx) for team_idx in new_teams.keys()}
         
-        # Assign to the team with the highest score
-        best_team = max(scores.items(), key=lambda x: x[1])[0]
-        new_teams[best_team].append(person_idx)
+        # Check if any team is eligible (not at max capacity)
+        if all(score == float('-inf') for score in scores.values()):
+            # If all teams are at max capacity, we need to add a new team
+            new_team_idx = len(new_teams) + 1
+            new_teams[new_team_idx] = [person_idx]
+            team_sizes[new_team_idx] = 1
+            st.warning(f"Added additional team {new_team_idx} because all existing teams reached maximum size.")
+        else:
+            # Assign to the team with the highest score
+            best_team = max(scores.items(), key=lambda x: x[1])[0]
+            new_teams[best_team].append(person_idx)
+            team_sizes[best_team] += 1
     
     # Create a new dataframe with the new team assignments
     new_df = df.copy()
@@ -278,6 +282,11 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
     for team_idx, members in new_teams.items():
         for member_idx in members:
             new_df.loc[member_idx, 'New Team'] = team_idx
+    
+    # Verify no team exceeds maximum size
+    team_size_check = new_df.groupby('New Team').size()
+    if team_size_check.max() > max_team_size:
+        st.error(f"Error: Team size check failed. Max team size: {team_size_check.max()} (should be ≤ {max_team_size})")
     
     return new_df
 
