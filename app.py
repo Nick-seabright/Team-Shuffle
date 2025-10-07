@@ -27,7 +27,7 @@ def is_enlisted(value, comp_col):
     return False
 
 def is_recruit(value, comp_col):
-    """Check if a value indicates a recruit based on ending with 'X'"""
+    """Check if a value indicates a 18X based on ending with 'X'"""
     if isinstance(value, str):
         return value.endswith('X')
     return False
@@ -70,7 +70,7 @@ def calculate_metrics(original_df, new_teams_df, column_config, is_reshuffle=Tru
             team_size = len(team_data)
             ratio_stats[team]["Officer %"] = officers / team_size * 100
             ratio_stats[team]["Enlisted %"] = enlisted / team_size * 100
-            ratio_stats[team]["Recruit %"] = recruits / team_size * 100
+            ratio_stats[team]["18X %"] = recruits / team_size * 100
     
     # Calculate ratios for columns with filled/empty values
     for column in column_config["priority_columns"]:
@@ -569,7 +569,7 @@ else:
     Upload an Excel file with your team data. The app will help you configure:
     
     1. Which column contains unique identifiers
-    2. Which column (if any) indicates personnel types (officers/enlisted/recruits)
+    2. Which column (if any) indicates personnel types (officers/enlisted/18X)
     3. Which columns to use for team formation priorities
     4. For reshuffling, which column indicates original teams
     5. Minimum and maximum team sizes
