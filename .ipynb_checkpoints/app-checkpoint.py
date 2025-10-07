@@ -70,7 +70,7 @@ def calculate_metrics(original_df, new_teams_df, column_config, is_reshuffle=Tru
             team_size = len(team_data)
             ratio_stats[team]["Officer %"] = officers / team_size * 100
             ratio_stats[team]["Enlisted %"] = enlisted / team_size * 100
-            ratio_stats[team]["Recruit %"] = recruits / team_size * 100
+            ratio_stats[team]["18X %"] = recruits / team_size * 100
     
     # Calculate ratios for columns with filled/empty values
     for column in column_config["priority_columns"]:
@@ -589,7 +589,13 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
     
     # Verify no team exceeds maximum size
     team_size_check = new_df.groupby('New Team').size()
-    st.write("Final team sizes:", dict(team_size_check))
+    team_size_dict = {int(team): int(size) for team, size in team_size_check.items()}
+    st.write("Final team sizes:")
+    team_size_df = pd.DataFrame({
+        'Team': list(team_size_dict.keys()),
+        'Size': list(team_size_dict.values())
+    })
+    st.table(team_size_df)
     
     if team_size_check.min() < min_team_size:
         st.warning(f"Some teams are still below minimum size. Smallest team has {team_size_check.min()} members (minimum: {min_team_size}).")
@@ -781,7 +787,7 @@ def display_team_details(new_teams_df, column_config, is_reshuffle=True):
                 
                 st.write(f"Officers: {len(officers)} ({len(officers)/len(team_data)*100:.1f}%)")
                 st.write(f"Enlisted: {len(enlisted)} ({len(enlisted)/len(team_data)*100:.1f}%)")
-                st.write(f"Recruits: {len(recruits)} ({len(recruits)/len(team_data)*100:.1f}%)")
+                st.write(f"18Xs: {len(recruits)} ({len(recruits)/len(team_data)*100:.1f}%)")
             
             # Show stats for each priority column
             for col in priority_columns:
