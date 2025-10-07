@@ -70,7 +70,7 @@ def calculate_metrics(original_df, new_teams_df, column_config, is_reshuffle=Tru
             team_size = len(team_data)
             ratio_stats[team]["Officer %"] = officers / team_size * 100
             ratio_stats[team]["Enlisted %"] = enlisted / team_size * 100
-            ratio_stats[team]["18X %"] = recruits / team_size * 100
+            ratio_stats[team]["Recruit %"] = recruits / team_size * 100
     
     # Calculate ratios for columns with filled/empty values
     for column in column_config["priority_columns"]:
@@ -122,11 +122,20 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
     # Determine the number of teams needed
     total_people = len(df)
     
-    # Always ensure we have enough teams so that no team exceeds max_team_size
-    num_teams = math.ceil(total_people / max_team_size)
+    # Calculate teams based on min and max team size
+    max_possible_teams = math.floor(total_people / min_team_size)
+    min_needed_teams = math.ceil(total_people / max_team_size)
+    
+    # Use the minimum number of teams that satisfies both constraints
+    num_teams = max(min_needed_teams, 1)
+    
+    # If min team size would make teams too large, warn and adjust
+    if max_possible_teams < num_teams:
+        st.warning(f"Can't create teams with at least {min_team_size} members each. Will create {num_teams} teams instead.")
+        min_team_size = math.floor(total_people / num_teams)
     
     st.write(f"Creating {num_teams} teams for {total_people} people.")
-    st.write(f"Team size range: {min_team_size}-{max_team_size} members (ideal: {max_team_size}).")
+    st.write(f"Team size range: {min_team_size}-{max_team_size} members (ideal: max)")
     
     # If we have a composition column, ensure at least one officer per team
     if comp_col:
@@ -178,6 +187,16 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
     if 'sort_columns' in locals() and sort_columns:
         rest = rest.sort_values(sort_columns)
     
+    # Calculate overall target ratios if comp_col is provided
+    if comp_col:
+        total_officers = sum(df[comp_col].apply(lambda x: is_officer(x, comp_col)))
+        total_enlisted = sum(df[comp_col].apply(lambda x: is_enlisted(x, comp_col)))
+        total_recruits = sum(df[comp_col].apply(lambda x: is_recruit(x, comp_col)))
+        
+        target_officer_ratio = total_officers / len(df)
+        target_enlisted_ratio = total_enlisted / len(df)
+        target_recruit_ratio = total_recruits / len(df)
+    
     # Create a scoring function for team assignment with strict max size enforcement
     def score_assignment(person_idx, team_idx):
         person = df.loc[person_idx]
@@ -187,6 +206,14 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
         # If team is already at max size, make it ineligible
         if team_size >= max_team_size:
             return float('-inf')  # Return negative infinity to ensure this team is not selected
+        
+        # If adding to this team would make it below min size, strongly encourage it
+        total_remaining = len(rest) - len([p for p in rest.index if p in [member for members in new_teams.values() for member in members]])
+        teams_below_min = [t for t, size in team_sizes.items() if size < min_team_size]
+        
+        if len(teams_below_min) > 0 and total_remaining <= len(teams_below_min) * (min_team_size - team_size):
+            if team_size < min_team_size:
+                return 100000  # Very high score to ensure teams reach minimum size
         
         # Start with a base score
         score = 0
@@ -204,6 +231,46 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
             same_team_count = sum(member[original_team_col] == person[original_team_col] for member in team_members)
             score -= same_team_count * penalty_weight
             penalty_weight *= 0.8  # Reduce weight for next priority
+        
+        # If we have a composition column, balance officer/enlisted/recruit (higher priority)
+        if comp_col and comp_col in df.columns:
+            comp_types = [member[comp_col] for member in team_members if not pd.isna(member[comp_col])]
+            if comp_types:
+                # Count officers, enlisted, recruits
+                officer_count = sum(is_officer(comp, comp_col) for comp in comp_types)
+                enlisted_count = sum(is_enlisted(comp, comp_col) for comp in comp_types) 
+                recruit_count = sum(is_recruit(comp, comp_col) for comp in comp_types)
+                
+                # Calculate current team ratios
+                current_team_size = len(team_members)
+                current_officer_ratio = officer_count / current_team_size if current_team_size > 0 else 0
+                current_enlisted_ratio = enlisted_count / current_team_size if current_team_size > 0 else 0
+                current_recruit_ratio = recruit_count / current_team_size if current_team_size > 0 else 0
+                
+                # Check if adding this person would improve the ratio balance
+                person_comp = person[comp_col]
+                new_team_size = current_team_size + 1
+                
+                if is_officer(person_comp, comp_col):
+                    new_officer_ratio = (officer_count + 1) / new_team_size
+                    # Penalty if adding officer makes ratio deviate more from target
+                    ratio_deviation = abs(new_officer_ratio - target_officer_ratio)
+                    current_deviation = abs(current_officer_ratio - target_officer_ratio)
+                    score -= (ratio_deviation - current_deviation) * penalty_weight * 300
+                elif is_enlisted(person_comp, comp_col):
+                    new_enlisted_ratio = (enlisted_count + 1) / new_team_size
+                    # Penalty if adding enlisted makes ratio deviate more from target
+                    ratio_deviation = abs(new_enlisted_ratio - target_enlisted_ratio)
+                    current_deviation = abs(current_enlisted_ratio - target_enlisted_ratio)
+                    score -= (ratio_deviation - current_deviation) * penalty_weight * 300
+                elif is_recruit(person_comp, comp_col):
+                    new_recruit_ratio = (recruit_count + 1) / new_team_size
+                    # Penalty if adding recruit makes ratio deviate more from target
+                    ratio_deviation = abs(new_recruit_ratio - target_recruit_ratio)
+                    current_deviation = abs(current_recruit_ratio - target_recruit_ratio)
+                    score -= (ratio_deviation - current_deviation) * penalty_weight * 300
+            
+            penalty_weight *= 0.7  # Reduce weight for next priority
         
         # Add penalties for each priority column
         for col in priority_columns:
@@ -237,24 +304,6 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
                 
                 penalty_weight *= 0.8  # Reduce weight for next priority
         
-        # If we have a composition column, balance officer/enlisted/recruit
-        if comp_col and comp_col in df.columns:
-            comp_types = [member[comp_col] for member in team_members if not pd.isna(member[comp_col])]
-            if comp_types:
-                # Count officers, enlisted, recruits
-                officer_count = sum(is_officer(comp, comp_col) for comp in comp_types)
-                enlisted_count = sum(is_enlisted(comp, comp_col) for comp in comp_types) 
-                recruit_count = sum(is_recruit(comp, comp_col) for comp in comp_types)
-                
-                # Penalize imbalances
-                person_comp = person[comp_col]
-                if is_officer(person_comp, comp_col) and officer_count > (len(team_members) / 5):  # Roughly 20% officers
-                    score -= penalty_weight * 0.5
-                elif is_enlisted(person_comp, comp_col) and enlisted_count > (len(team_members) * 0.6):  # Roughly 60% enlisted
-                    score -= penalty_weight * 0.5
-                elif is_recruit(person_comp, comp_col) and recruit_count > (len(team_members) * 0.3):  # Roughly 30% recruits
-                    score -= penalty_weight * 0.5
-        
         return score
     
     # Distribute the rest based on the scoring function
@@ -275,6 +324,261 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
             new_teams[best_team].append(person_idx)
             team_sizes[best_team] += 1
     
+    # Perform a second pass to balance composition if comp_col is provided
+    if comp_col:
+        st.write("Performing composition balancing...")
+        
+        # Get composition stats for each team
+        team_comp_stats = {}
+        for team_idx in range(1, num_teams + 1):
+            team_members = new_teams.get(team_idx, [])
+            if team_members:
+                team_data = df.loc[team_members]
+                officer_count = sum(team_data[comp_col].apply(lambda x: is_officer(x, comp_col)))
+                enlisted_count = sum(team_data[comp_col].apply(lambda x: is_enlisted(x, comp_col)))
+                recruit_count = sum(team_data[comp_col].apply(lambda x: is_recruit(x, comp_col)))
+                
+                team_comp_stats[team_idx] = {
+                    'officer_ratio': officer_count / len(team_members),
+                    'enlisted_ratio': enlisted_count / len(team_members),
+                    'recruit_ratio': recruit_count / len(team_members),
+                    'size': len(team_members)
+                }
+        
+        # Calculate overall composition ratios
+        total_officers = sum(df[comp_col].apply(lambda x: is_officer(x, comp_col)))
+        total_enlisted = sum(df[comp_col].apply(lambda x: is_enlisted(x, comp_col)))
+        total_recruits = sum(df[comp_col].apply(lambda x: is_recruit(x, comp_col)))
+        
+        target_officer_ratio = total_officers / total_people
+        target_enlisted_ratio = total_enlisted / total_people
+        target_recruit_ratio = total_recruits / total_people
+        
+        # Perform composition balancing iterations
+        max_iterations = 20
+        total_swaps = 0
+        for iteration in range(max_iterations):
+            made_swap = False
+            
+            # For each team with high/low officer ratio, try to swap with a team that has opposite imbalance
+            for team_a_idx in range(1, num_teams + 1):
+                if team_a_idx not in team_comp_stats:
+                    continue
+                    
+                team_a_stats = team_comp_stats[team_a_idx]
+                
+                # Check if this team has composition imbalance
+                a_officer_imbalance = team_a_stats['officer_ratio'] - target_officer_ratio
+                a_enlisted_imbalance = team_a_stats['enlisted_ratio'] - target_enlisted_ratio
+                a_recruit_imbalance = team_a_stats['recruit_ratio'] - target_recruit_ratio
+                
+                # Find a team with opposite imbalance to swap with
+                for team_b_idx in range(1, num_teams + 1):
+                    if team_b_idx == team_a_idx or team_b_idx not in team_comp_stats:
+                        continue
+                        
+                    team_b_stats = team_comp_stats[team_b_idx]
+                    
+                    # Check if team B has opposite imbalance
+                    b_officer_imbalance = team_b_stats['officer_ratio'] - target_officer_ratio
+                    b_enlisted_imbalance = team_b_stats['enlisted_ratio'] - target_enlisted_ratio
+                    b_recruit_imbalance = team_b_stats['recruit_ratio'] - target_recruit_ratio
+                    
+                    # If teams have opposite imbalances, try to swap members
+                    if (a_officer_imbalance * b_officer_imbalance < 0 or 
+                        a_enlisted_imbalance * b_enlisted_imbalance < 0 or
+                        a_recruit_imbalance * b_recruit_imbalance < 0):
+                        
+                        # Find candidates for swapping
+                        team_a_members = new_teams[team_a_idx]
+                        team_b_members = new_teams[team_b_idx]
+                        
+                        # Identify what we need to swap:
+                        swap_type = None
+                        if abs(a_officer_imbalance) > 0.05 and abs(b_officer_imbalance) > 0.05:
+                            if a_officer_imbalance > 0 and b_officer_imbalance < 0:
+                                # Team A has too many officers, team B has too few
+                                swap_type = ('officer', 'non_officer')
+                            elif a_officer_imbalance < 0 and b_officer_imbalance > 0:
+                                # Team B has too many officers, team A has too few
+                                swap_type = ('non_officer', 'officer')
+                        elif abs(a_enlisted_imbalance) > 0.05 and abs(b_enlisted_imbalance) > 0.05:
+                            if a_enlisted_imbalance > 0 and b_enlisted_imbalance < 0:
+                                # Team A has too many enlisted, team B has too few
+                                swap_type = ('enlisted', 'non_enlisted')
+                            elif a_enlisted_imbalance < 0 and b_enlisted_imbalance > 0:
+                                # Team B has too many enlisted, team A has too few
+                                swap_type = ('non_enlisted', 'enlisted')
+                        elif abs(a_recruit_imbalance) > 0.05 and abs(b_recruit_imbalance) > 0.05:
+                            if a_recruit_imbalance > 0 and b_recruit_imbalance < 0:
+                                # Team A has too many recruits, team B has too few
+                                swap_type = ('recruit', 'non_recruit')
+                            elif a_recruit_imbalance < 0 and b_recruit_imbalance > 0:
+                                # Team B has too many recruits, team A has too few
+                                swap_type = ('non_recruit', 'recruit')
+                        
+                        if swap_type:
+                            # Find candidates based on swap type
+                            from_type, to_type = swap_type
+                            from_team_idx = team_a_idx
+                            to_team_idx = team_b_idx
+                            
+                            # Select candidates from each team
+                            if from_type == 'officer':
+                                from_candidates = [idx for idx in team_a_members 
+                                              if is_officer(df.loc[idx, comp_col], comp_col)]
+                            elif from_type == 'non_officer':
+                                from_candidates = [idx for idx in team_a_members 
+                                              if not is_officer(df.loc[idx, comp_col], comp_col)]
+                            elif from_type == 'enlisted':
+                                from_candidates = [idx for idx in team_a_members 
+                                              if is_enlisted(df.loc[idx, comp_col], comp_col)]
+                            elif from_type == 'non_enlisted':
+                                from_candidates = [idx for idx in team_a_members 
+                                              if not is_enlisted(df.loc[idx, comp_col], comp_col)]
+                            elif from_type == 'recruit':
+                                from_candidates = [idx for idx in team_a_members 
+                                              if is_recruit(df.loc[idx, comp_col], comp_col)]
+                            elif from_type == 'non_recruit':
+                                from_candidates = [idx for idx in team_a_members 
+                                              if not is_recruit(df.loc[idx, comp_col], comp_col)]
+                            
+                            if to_type == 'officer':
+                                to_candidates = [idx for idx in team_b_members 
+                                            if is_officer(df.loc[idx, comp_col], comp_col)]
+                            elif to_type == 'non_officer':
+                                to_candidates = [idx for idx in team_b_members 
+                                            if not is_officer(df.loc[idx, comp_col], comp_col)]
+                            elif to_type == 'enlisted':
+                                to_candidates = [idx for idx in team_b_members 
+                                            if is_enlisted(df.loc[idx, comp_col], comp_col)]
+                            elif to_type == 'non_enlisted':
+                                to_candidates = [idx for idx in team_b_members 
+                                            if not is_enlisted(df.loc[idx, comp_col], comp_col)]
+                            elif to_type == 'recruit':
+                                to_candidates = [idx for idx in team_b_members 
+                                            if is_recruit(df.loc[idx, comp_col], comp_col)]
+                            elif to_type == 'non_recruit':
+                                to_candidates = [idx for idx in team_b_members 
+                                            if not is_recruit(df.loc[idx, comp_col], comp_col)]
+                            
+                            # If we have candidates, perform a swap
+                            if from_candidates and to_candidates:
+                                # Choose candidates at random
+                                from_idx = random.choice(from_candidates)
+                                to_idx = random.choice(to_candidates)
+                                
+                                # Swap the members
+                                new_teams[from_team_idx].remove(from_idx)
+                                new_teams[from_team_idx].append(to_idx)
+                                new_teams[to_team_idx].remove(to_idx)
+                                new_teams[to_team_idx].append(from_idx)
+                                
+                                # Update team composition stats
+                                for team_idx in [from_team_idx, to_team_idx]:
+                                    team_members = new_teams[team_idx]
+                                    team_data = df.loc[team_members]
+                                    officer_count = sum(team_data[comp_col].apply(lambda x: is_officer(x, comp_col)))
+                                    enlisted_count = sum(team_data[comp_col].apply(lambda x: is_enlisted(x, comp_col)))
+                                    recruit_count = sum(team_data[comp_col].apply(lambda x: is_recruit(x, comp_col)))
+                                    
+                                    team_comp_stats[team_idx] = {
+                                        'officer_ratio': officer_count / len(team_members),
+                                        'enlisted_ratio': enlisted_count / len(team_members),
+                                        'recruit_ratio': recruit_count / len(team_members),
+                                        'size': len(team_members)
+                                    }
+                                
+                                total_swaps += 1
+                                made_swap = True
+                                break
+                
+                if made_swap:
+                    break
+            
+            if not made_swap:
+                break
+        
+        if total_swaps > 0:
+            st.write(f"Made {total_swaps} swaps to improve composition balance")
+    
+    # Make one final pass to ensure minimum team size
+    team_sizes = {team_idx: len(members) for team_idx, members in new_teams.items()}
+    teams_below_min = {team_idx: size for team_idx, size in team_sizes.items() if size < min_team_size}
+    
+    if teams_below_min:
+        st.warning(f"Some teams are below the minimum size: {teams_below_min}")
+        
+        # Try to redistribute from largest teams to meet minimum size
+        teams_above_min = {team_idx: size for team_idx, size in team_sizes.items() if size > min_team_size}
+        
+        # Sort teams by size (largest first)
+        sorted_teams_above_min = sorted(teams_above_min.items(), key=lambda x: x[1], reverse=True)
+        
+        for small_team_idx, small_team_size in teams_below_min.items():
+            members_needed = min_team_size - small_team_size
+            
+            for large_team_idx, large_team_size in sorted_teams_above_min:
+                available_to_move = large_team_size - min_team_size
+                
+                if available_to_move > 0:
+                    # Find members to move
+                    num_to_move = min(members_needed, available_to_move)
+                    
+                    if num_to_move > 0:
+                        # Try to select diverse members to maintain balance
+                        members_to_move = []
+                        large_team_members = new_teams[large_team_idx]
+                        
+                        if comp_col:
+                            # Get a mix of member types
+                            large_team_data = df.loc[large_team_members]
+                            officers = large_team_data[large_team_data[comp_col].apply(lambda x: is_officer(x, comp_col))]
+                            enlisted = large_team_data[large_team_data[comp_col].apply(lambda x: is_enlisted(x, comp_col))]
+                            recruits = large_team_data[large_team_data[comp_col].apply(lambda x: is_recruit(x, comp_col))]
+                            
+                            # Determine how many of each to move based on overall ratios
+                            officers_to_move = min(len(officers), int(num_to_move * target_officer_ratio) + 1)
+                            enlisted_to_move = min(len(enlisted), int(num_to_move * target_enlisted_ratio) + 1)
+                            recruits_to_move = min(len(recruits), num_to_move - officers_to_move - enlisted_to_move)
+                            
+                            # Adjust if we're not moving enough
+                            total_moving = officers_to_move + enlisted_to_move + recruits_to_move
+                            if total_moving < num_to_move:
+                                # Add more from the largest category
+                                if len(enlisted) > len(officers) and len(enlisted) > len(recruits):
+                                    enlisted_to_move += num_to_move - total_moving
+                                elif len(recruits) > len(officers) and len(recruits) > len(enlisted):
+                                    recruits_to_move += num_to_move - total_moving
+                                else:
+                                    officers_to_move += num_to_move - total_moving
+                            
+                            # Select members to move
+                            if officers_to_move > 0:
+                                members_to_move.extend(officers.sample(min(officers_to_move, len(officers))).index.tolist())
+                            if enlisted_to_move > 0:
+                                members_to_move.extend(enlisted.sample(min(enlisted_to_move, len(enlisted))).index.tolist())
+                            if recruits_to_move > 0:
+                                members_to_move.extend(recruits.sample(min(recruits_to_move, len(recruits))).index.tolist())
+                        else:
+                            # Just select random members
+                            members_to_move = random.sample(large_team_members, num_to_move)
+                        
+                        # Move the members
+                        for member_idx in members_to_move:
+                            new_teams[large_team_idx].remove(member_idx)
+                            new_teams[small_team_idx].append(member_idx)
+                        
+                        # Update tracking
+                        members_needed -= len(members_to_move)
+                        team_sizes[large_team_idx] -= len(members_to_move)
+                        team_sizes[small_team_idx] += len(members_to_move)
+                        
+                        st.write(f"Moved {len(members_to_move)} members from Team {large_team_idx} to Team {small_team_idx}")
+                
+                if members_needed <= 0:
+                    break
+    
     # Create a new dataframe with the new team assignments
     new_df = df.copy()
     new_df['New Team'] = 0
@@ -285,6 +589,11 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
     
     # Verify no team exceeds maximum size
     team_size_check = new_df.groupby('New Team').size()
+    st.write("Final team sizes:", dict(team_size_check))
+    
+    if team_size_check.min() < min_team_size:
+        st.warning(f"Some teams are still below minimum size. Smallest team has {team_size_check.min()} members (minimum: {min_team_size}).")
+    
     if team_size_check.max() > max_team_size:
         st.error(f"Error: Team size check failed. Max team size: {team_size_check.max()} (should be ≤ {max_team_size})")
     
@@ -472,7 +781,7 @@ def display_team_details(new_teams_df, column_config, is_reshuffle=True):
                 
                 st.write(f"Officers: {len(officers)} ({len(officers)/len(team_data)*100:.1f}%)")
                 st.write(f"Enlisted: {len(enlisted)} ({len(enlisted)/len(team_data)*100:.1f}%)")
-                st.write(f"18Xs: {len(recruits)} ({len(recruits)/len(team_data)*100:.1f}%)")
+                st.write(f"Recruits: {len(recruits)} ({len(recruits)/len(team_data)*100:.1f}%)")
             
             # Show stats for each priority column
             for col in priority_columns:
@@ -813,7 +1122,7 @@ else:
     Upload an Excel file with your team data. The app will help you configure:
     
     1. Which column contains unique identifiers
-    2. Which column (if any) indicates personnel types (officers/enlisted/18Xs)
+    2. Which column (if any) indicates personnel types (officers/enlisted/recruits)
     3. Which columns to use for team formation priorities
     4. For reshuffling, which column indicates original teams
     5. Minimum and maximum team sizes
