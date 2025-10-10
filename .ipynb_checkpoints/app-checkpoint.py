@@ -70,7 +70,7 @@ def calculate_metrics(original_df, new_teams_df, column_config, is_reshuffle=Tru
             team_size = len(team_data)
             ratio_stats[team]["Officer %"] = officers / team_size * 100
             ratio_stats[team]["Enlisted %"] = enlisted / team_size * 100
-            ratio_stats[team]["18X %"] = recruits / team_size * 100
+            ratio_stats[team]["Recruit %"] = recruits / team_size * 100
     
     # Calculate ratios for columns with filled/empty values
     for column in column_config["priority_columns"]:
@@ -102,10 +102,14 @@ def calculate_metrics(original_df, new_teams_df, column_config, is_reshuffle=Tru
     
     return metrics, ratio_stats
 
-def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_size=13, max_team_size=18):
+def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_size=13, max_team_size=18, random_seed=42):
     """
     Create new teams or reshuffle existing teams based on provided configuration
     """
+    # Set the random seed for reproducibility
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    
     # Copy the original dataframe
     original_df = df.copy()
     
@@ -589,6 +593,8 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
     
     # Verify no team exceeds maximum size
     team_size_check = new_df.groupby('New Team').size()
+    
+    # Convert to a nice format for display
     team_size_dict = {int(team): int(size) for team, size in team_size_check.items()}
     st.write("Final team sizes:")
     team_size_df = pd.DataFrame({
@@ -604,6 +610,127 @@ def create_or_reshuffle_teams(df, column_config, is_reshuffle=True, min_team_siz
         st.error(f"Error: Team size check failed. Max team size: {team_size_check.max()} (should be ≤ {max_team_size})")
     
     return new_df
+
+def export_team_statistics(new_teams_df, metrics, ratio_stats, column_config):
+    """
+    Generate exportable team statistics
+    """
+    # Overall statistics
+    overall_stats = pd.DataFrame({
+        'Metric': [
+            'Min Team Size', 
+            'Max Team Size', 
+            'Average Team Size'
+        ],
+        'Value': [
+            metrics['team_size_min'],
+            metrics['team_size_max'],
+            f"{metrics['team_size_avg']:.1f}"
+        ]
+    })
+    
+    # Add any standard deviation metrics
+    std_metrics = []
+    std_values = []
+    for key, value in metrics.items():
+        if key.endswith("_std") and "values" not in key:
+            nice_name = key.replace("_std", " Standard Deviation").replace("_", " ").title()
+            std_metrics.append(nice_name)
+            if "%" in nice_name:
+                std_values.append(f"{value:.2f}%")
+            else:
+                std_values.append(f"{value:.2f}")
+    
+    std_stats = pd.DataFrame({
+        'Metric': std_metrics,
+        'Value': std_values
+    })
+    
+    # Composition statistics by team
+    if ratio_stats:
+        teams = sorted(ratio_stats.keys())
+        team_stats = {}
+        
+        # Add team numbers
+        team_stats['Team'] = [f"Team {team}" for team in teams]
+        
+        # Add all available stats
+        all_stat_names = set()
+        for team_stats_dict in ratio_stats.values():
+            all_stat_names.update(team_stats_dict.keys())
+        
+        for stat_name in sorted(all_stat_names):
+            team_stats[stat_name] = [f"{ratio_stats[team].get(stat_name, 0):.1f}%" for team in teams]
+        
+        composition_stats = pd.DataFrame(team_stats)
+    else:
+        composition_stats = pd.DataFrame()
+    
+    # Detailed team information
+    team_details = []
+    id_col = column_config["id_column"]
+    comp_col = column_config.get("comp_column")
+    
+    for team in sorted(new_teams_df['New Team'].unique()):
+        team_data = new_teams_df[new_teams_df['New Team'] == team]
+        
+        # Basic team stats
+        team_info = {
+            'Team': f"Team {team}",
+            'Size': len(team_data)
+        }
+        
+        # If we have a composition column, add officer/enlisted/recruit breakdowns
+        if comp_col:
+            officers = team_data[team_data[comp_col].apply(lambda x: is_officer(x, comp_col))]
+            enlisted = team_data[team_data[comp_col].apply(lambda x: is_enlisted(x, comp_col))]
+            recruits = team_data[team_data[comp_col].apply(lambda x: is_recruit(x, comp_col))]
+            
+            team_info['Officers'] = len(officers)
+            team_info['Officer %'] = f"{len(officers)/len(team_data)*100:.1f}%"
+            team_info['Enlisted'] = len(enlisted)
+            team_info['Enlisted %'] = f"{len(enlisted)/len(team_data)*100:.1f}%"
+            team_info['Recruits'] = len(recruits)
+            team_info['Recruit %'] = f"{len(recruits)/len(team_data)*100:.1f}%"
+        
+        # Add info for other important columns
+        for col in column_config["priority_columns"]:
+            if col in team_data.columns:
+                # For columns with both filled and empty values, show the balance
+                if team_data[col].notna().any() and team_data[col].isna().any():
+                    filled = team_data[col].notna().sum()
+                    team_info[f"{col} Filled"] = filled
+                    team_info[f"{col} Filled %"] = f"{filled/len(team_data)*100:.1f}%"
+                
+                # For numeric columns, show average
+                if pd.api.types.is_numeric_dtype(team_data[col]):
+                    team_info[f"Avg {col}"] = f"{team_data[col].mean():.2f}"
+        
+        team_details.append(team_info)
+    
+    team_details_df = pd.DataFrame(team_details)
+    
+    return overall_stats, std_stats, composition_stats, team_details_df
+
+def export_all_statistics(new_teams_df, metrics, ratio_stats, column_config):
+    overall_stats, std_stats, composition_stats, team_details_df = export_team_statistics(
+        new_teams_df, metrics, ratio_stats, column_config
+    )
+    
+    # Combine into a single Excel file with multiple sheets
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        overall_stats.to_excel(writer, sheet_name="Overall Statistics", index=False)
+        std_stats.to_excel(writer, sheet_name="Standard Deviations", index=False)
+        
+        if not composition_stats.empty:
+            composition_stats.to_excel(writer, sheet_name="Team Composition", index=False)
+        
+        team_details_df.to_excel(writer, sheet_name="Team Details", index=False)
+        new_teams_df.to_excel(writer, sheet_name="Full Team Assignments", index=False)
+    
+    processed_data = output.getvalue()
+    return processed_data
 
 def display_metrics(metrics, ratio_stats, column_config, is_reshuffle=True):
     st.subheader("Team Formation Metrics")
@@ -787,7 +914,7 @@ def display_team_details(new_teams_df, column_config, is_reshuffle=True):
                 
                 st.write(f"Officers: {len(officers)} ({len(officers)/len(team_data)*100:.1f}%)")
                 st.write(f"Enlisted: {len(enlisted)} ({len(enlisted)/len(team_data)*100:.1f}%)")
-                st.write(f"18Xs: {len(recruits)} ({len(recruits)/len(team_data)*100:.1f}%)")
+                st.write(f"Recruits: {len(recruits)} ({len(recruits)/len(team_data)*100:.1f}%)")
             
             # Show stats for each priority column
             for col in priority_columns:
@@ -992,12 +1119,24 @@ def edit_teams(new_teams_df, column_config):
         'Edited Teams': edited_df
     })
     
-    st.download_button(
-        label="Download Excel with edited teams",
-        data=excel_data,
-        file_name="edited_teams.xlsx",
-        mime="application/vnd.ms-excel"
-    )
+    # Download buttons for team data and statistics
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            label="Download Excel with edited teams",
+            data=excel_data,
+            file_name="edited_teams.xlsx",
+            mime="application/vnd.ms-excel"
+        )
+    
+    with col2:
+        stats_data = export_all_statistics(edited_df, metrics, ratio_stats, column_config)
+        st.download_button(
+            label="Download Statistics Report",
+            data=stats_data,
+            file_name="team_statistics_edited.xlsx",
+            mime="application/vnd.ms-excel"
+        )
     
     return edited_df
 
@@ -1036,6 +1175,11 @@ if uploaded_file is not None:
         with col2:
             max_team_size = st.number_input("Maximum team size (ideal size):", min_value=min_team_size, value=18)
         
+        # Randomization settings
+        st.subheader("Randomization Settings")
+        random_seed = st.number_input("Random seed (for reproducible shuffling):", 
+                                    min_value=0, max_value=999999, value=42)
+        
         # Proceed with team formation
         if st.button("Process Teams"):
             # Ensure we have required configurations
@@ -1045,7 +1189,8 @@ if uploaded_file is not None:
                 with st.spinner("Processing teams..."):
                     is_reshuffle = operation == "Reshuffle existing teams"
                     new_teams_df = create_or_reshuffle_teams(df, column_config, is_reshuffle=is_reshuffle, 
-                                                            min_team_size=min_team_size, max_team_size=max_team_size)
+                                                            min_team_size=min_team_size, max_team_size=max_team_size,
+                                                            random_seed=random_seed)
                     metrics, ratio_stats = calculate_metrics(df, new_teams_df, column_config, is_reshuffle=is_reshuffle)
                     
                     # Store the results in session state
@@ -1055,6 +1200,7 @@ if uploaded_file is not None:
                     st.session_state['is_reshuffle'] = is_reshuffle
                     st.session_state['min_team_size'] = min_team_size
                     st.session_state['max_team_size'] = max_team_size
+                    st.session_state['random_seed'] = random_seed
                     st.session_state['teams_processed'] = True
                     
                     # Clear any previous edited teams
@@ -1072,6 +1218,7 @@ if uploaded_file is not None:
             is_reshuffle = st.session_state['is_reshuffle']
             min_team_size = st.session_state['min_team_size']
             max_team_size = st.session_state['max_team_size']
+            random_seed = st.session_state['random_seed']
             
             # Display metrics and team assignments
             display_metrics(metrics, ratio_stats, column_config, is_reshuffle=is_reshuffle)
@@ -1079,18 +1226,33 @@ if uploaded_file is not None:
             st.subheader(f"{'New' if is_reshuffle else ''} Team Assignments")
             st.dataframe(new_teams_df.sort_values(['New Team']))
             
-            # Prepare Excel download
-            excel_data = to_excel({
-                'Original Data': df,
-                'New Teams': new_teams_df
-            })
+            # Download buttons for team data and statistics
+            col1, col2 = st.columns(2)
             
-            st.download_button(
-                label=f"Download Excel with {'new' if is_reshuffle else ''} teams",
-                data=excel_data,
-                file_name=f"{'reshuffled' if is_reshuffle else 'new'}_teams.xlsx",
-                mime="application/vnd.ms-excel"
-            )
+            with col1:
+                # Prepare Excel download
+                excel_data = to_excel({
+                    'Original Data': df,
+                    'New Teams': new_teams_df
+                })
+                
+                st.download_button(
+                    label=f"Download Excel with {'new' if is_reshuffle else ''} teams",
+                    data=excel_data,
+                    file_name=f"{'reshuffled' if is_reshuffle else 'new'}_teams_seed{random_seed}.xlsx",
+                    mime="application/vnd.ms-excel"
+                )
+            
+            with col2:
+                # Prepare statistics download
+                stats_data = export_all_statistics(new_teams_df, metrics, ratio_stats, column_config)
+                
+                st.download_button(
+                    label="Download Statistics Report",
+                    data=stats_data,
+                    file_name=f"team_statistics_seed{random_seed}.xlsx",
+                    mime="application/vnd.ms-excel"
+                )
             
             # Show detailed team view
             display_team_details(new_teams_df, column_config, is_reshuffle=is_reshuffle)
@@ -1141,13 +1303,3 @@ else:
     
     You can then customize the column selection and priorities to match your specific needs.
     """)
-
-# Add footer with instructions for GitHub deployment
-st.markdown("---")
-st.markdown("""
-### How to deploy this app:
-1. Create a GitHub repository
-2. Add this file as `app.py`
-3. Create a `requirements.txt` file with the dependencies listed below
-4. Deploy to Streamlit Cloud by connecting to your GitHub repository
-""")
